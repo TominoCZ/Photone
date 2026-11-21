@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from itertools import pairwise  # noqa: E402
+from itertools import pairwise, product  # noqa: E402
 from multiprocessing.shared_memory import SharedMemory  # noqa: E402
 
 from PySide6.QtCore import QCoreApplication, QSettings, Qt, QUrl  # noqa: E402
@@ -2885,6 +2885,66 @@ def check_denoise_refused() -> None:
     assert net.fast.asked == 3 and net.where == "the processor", (net.fast.asked, net.where)
 
 
+def check_denoise_exact() -> None:
+    """The denoiser's arithmetic, made quicker, is the same to the last bit as written plainly
+    beside it here: the median of six, the noise read off a mosaic, the photo in the net's
+    terms and back, the shares mixed back, and the pieces cut ahead."""
+    rng = np.random.default_rng(11)
+    six = np.concatenate([np.array(list(product((0.0, 1.0), repeat=6))), rng.random((3000, 6))])
+    six = six.astype(np.float32)
+    six[::7, 3] = six[::7, 1]  # (ties too)
+    assert (denoise._median_of_six(six) == np.median(six, axis=-1)).all(), "the median of six"
+
+    def plain(values, share=1 / 3):  # of_mosaic as first written: a mask of all of it per band
+        v = values.astype(np.float32)
+        h, w = v.shape[0] // 2 * 2, v.shape[1] // 16 * 16
+        runs = [v[dy:h:2, dx:w:2].reshape(h // 2, w // 16, 8) for dy, dx in product((0, 1), (0, 1))]
+        signal = np.concatenate([r.mean(axis=2).ravel() for r in runs])
+        spread = np.concatenate([np.median(np.abs(r[:, :, 2:] - r[:, :, :-2]), axis=2).ravel()
+                                 / 0.6745 / np.sqrt(2) for r in runs])
+        edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31)))
+        xs, vs = [], []
+        for low, high in pairwise(edges):
+            here = (signal >= low) & (signal < high)
+            if here.sum() >= 300:
+                calm = np.argsort(spread[here])[:int(here.sum() * share)]
+                xs.append(signal[here][calm].mean())
+                vs.append((spread[here][calm].mean() / denoise._calmest(share)) ** 2)
+        xs, vs = np.array(xs, float), np.array(vs, float)
+        a, b = np.polyfit(xs, vs, 1, w=1 / np.maximum(vs, 1e-9)) if len(xs) > 1 else (0.0, 0.0)
+        if a <= 0:
+            a, b = 1e-6, float(np.median(vs)) if len(vs) else 1.0
+        return float(a), float(max(b, 1e-6))
+
+    y, x = np.mgrid[0:480, 0:960]
+    scene = 800 + 3000 * x / 960 + 400 * np.sin(y / 9)
+    for mosaic in (scene + rng.standard_normal(scene.shape) * np.sqrt(scene + 40),  # (lit unevenly)
+                   (scene + rng.standard_normal(scene.shape) * 30).astype(np.uint16),  # (whole numbers: ties)
+                   rng.normal(500, 10, (640, 960)), np.zeros((40, 30))):  # (flat; too small for a band)
+        assert denoise.of_mosaic(mosaic) == plain(mosaic), (denoise.of_mosaic(mosaic), plain(mosaic))
+
+    cam_xyz = [[0.746, -0.2365, -0.0588], [-0.5687, 1.3442, 0.2474], [-0.0624, 0.1156, 0.6584]]
+    about = {"wb": [2.4, 1.0, 1.6], "cam_xyz": cam_xyz, "a": 2.0, "b": 30.0, "room": 15868.0}
+    noisy = rng.integers(0, 65536, (40, 50, 3), dtype=np.uint16)
+    noisy[:3], noisy[3:6] = 0, 65535
+    held = denoise.Denoised(noisy, about)
+    v = held.scale * np.sqrt(np.maximum((noisy.astype(np.float32) / 65535) @ held.to_cam.T + held.offset, 0))
+    assert (held.into(noisy) == v).all(), "into the net's terms"
+    held.clean[...] = v + rng.standard_normal(v.shape).astype(np.float32)
+    clean = held.clean.copy()
+    back = lambda v: (np.maximum(v, 0) / held.scale) ** 2 - held.offset  # noqa: E731
+    assert (held.camera(clean) == back(clean)).all() and (held.clean == clean).all(), "and back, the given left alone"
+    removed = v - clean
+    common = removed.mean(axis=2, keepdims=True)
+    for color, grain in ((1, 1), (0, 0), (0.5, 0.5), (0.3, 0.8), (0.77, 0.13)):
+        mixed = back(clean + (1 - grain) * common + (1 - color) * (removed - common))
+        assert (held.mixed(slice(0, 40), color, grain) == mixed).all(), (color, grain)
+    assert (held.clean == clean).all(), "mixing leaves the net's result as it was"
+
+    assert list(denoise._ahead(lambda at: at * 2, [3, 1, 2])) == [6, 2, 4], "in their order"
+    assert list(denoise._ahead(lambda at: at, [])) == [], "no pieces, nothing cut"
+
+
 def check_denoise_sample(path: Path) -> None:
     """A real raw file through the net (on the GPU where there is one), written and read back."""
     with tempfile.TemporaryDirectory() as folder:
@@ -3011,6 +3071,7 @@ def main() -> None:
     check_kept()
     check_denoise()
     check_denoise_refused()
+    check_denoise_exact()
     check_workers()
     check_no_orphan()
     check_surface_choice()

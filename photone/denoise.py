@@ -19,6 +19,7 @@ down with it, the upgrade is a process of its own, as decoding has (decode.Worke
 from __future__ import annotations
 
 import contextlib
+import functools
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
@@ -59,36 +60,72 @@ class Stopped(Exception):
 
 # --- The noise of a photo ------------------------------------------------------------------
 
+@functools.cache
 def _calmest(share: float = 1 / 3) -> float:
     """What the calmest third of such readings gives for pure noise of one unit: they are the
-    ones that came out low by chance, so their mean is below 1 (0.61)."""
+    ones that came out low by chance, so their mean is below 1 (0.61). (The same every time:
+    worked out once.)"""
     runs = np.random.default_rng(7).standard_normal((200000, 8))
     each = np.sort(np.median(np.abs(runs[:, 2:] - runs[:, :-2]), axis=1) / 0.6745 / np.sqrt(2))
     return float(each[:int(len(each) * share)].mean())
 
 
-def of_mosaic(values: np.ndarray, share: float = 1 / 3) -> tuple[float, float]:
-    """(a, b) of a mosaic with its black level taken off: the noise's variance is
-    a * signal + b. From pixels of one color four apart along a row, by how light the place
-    is; of every lightness the calmest places count, since texture is not noise."""
+# The 11 compare-and-swaps that put the third and fourth smallest of six values in places 2
+# and 3 (an optimal sorting network of six, but for its last, which would only order those
+# two: their sum is the same either way).
+_SIX = ((1, 2), (4, 5), (0, 2), (3, 5), (0, 1), (3, 4), (1, 4), (0, 3), (2, 5), (1, 3), (2, 4))
+
+
+def _median_of_six(d: np.ndarray) -> np.ndarray:
+    """np.median(d, axis=-1) for a last axis of six, the same numbers: the mean of the third
+    and fourth smallest, sorted by whole arrays at a time (np.median sorts six values at a
+    time, a call each, and took twice as long)."""
+    six = [d[..., i] for i in range(6)]
+    for i, j in _SIX:
+        six[i], six[j] = np.minimum(six[i], six[j]), np.maximum(six[i], six[j])
+    return (six[2] + six[3]) * 0.5
+
+
+def _readings(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(signal, spread) of every run of eight pixels of one color in a row of a mosaic: their
+    mean, and the noise their differences four apart show."""
     v = values.astype(np.float32)
     h, w = v.shape[0] // 2 * 2, v.shape[1] // 16 * 16
     signals, spreads = [], []
     for dy, dx in product((0, 1), (0, 1)):
         runs = v[dy:h:2, dx:w:2].reshape(h // 2, w // 16, 8)  # eight of one color in a row
         signals.append(runs.mean(axis=2).ravel())
-        spreads.append(np.median(np.abs(runs[:, :, 2:] - runs[:, :, :-2]), axis=2).ravel()
+        spreads.append(_median_of_six(np.abs(runs[:, :, 2:] - runs[:, :, :-2])).ravel()
                        / 0.6745 / np.sqrt(2))
-    signal, spread = np.concatenate(signals), np.concatenate(spreads)
+    return np.concatenate(signals), np.concatenate(spreads)
+
+
+def of_mosaic(values: np.ndarray, share: float = 1 / 3) -> tuple[float, float]:
+    """(a, b) of a mosaic with its black level taken off: the noise's variance is
+    a * signal + b. From pixels of one color four apart along a row, by how light the place
+    is; of every lightness the calmest places count, since texture is not noise.
+
+    Each reading is put in its band of lightness once (one pass, then a sort by band number
+    that keeps their order), where it was a mask of the whole photo for each of 30 bands:
+    a band's readings come out the same, in the same order, and are sorted as they were, so
+    (a, b) are the same to the last bit. (The masks were 0.6 s of 1.3 for a 33 MP photo.)"""
+    signal, spread = _readings(values)
     edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31)))
+    # (Band i holds edges[i] <= signal < edges[i + 1], as the masks had it.)
+    band = np.searchsorted(edges, signal, side="right") - 1
+    inside = np.flatnonzero((band >= 0) & (band < len(edges) - 1))
+    band = band[inside].astype(np.int16)
+    order = inside[np.argsort(band, kind="stable")]
+    counts = np.bincount(band, minlength=len(edges) - 1)
     xs, vs, calmest = [], [], _calmest(share)
-    for low, high in zip(edges[:-1], edges[1:], strict=True):
-        here = (signal >= low) & (signal < high)
-        if here.sum() < 300:
+    for start, count in zip(np.cumsum(counts) - counts, counts, strict=True):
+        if count < 300:
             continue
-        calm = np.argsort(spread[here])[:int(here.sum() * share)]
+        here = order[start:start + count]
+        spread_here = spread[here]
+        calm = np.argsort(spread_here)[:int(count * share)]
         xs.append(signal[here][calm].mean())  # (their own signal: the calmest are the darker)
-        vs.append((spread[here][calm].mean() / calmest) ** 2)
+        vs.append((spread_here[calm].mean() / calmest) ** 2)
     xs, vs = np.array(xs, float), np.array(vs, float)
     a, b = np.polyfit(xs, vs, 1, w=1 / np.maximum(vs, 1e-9)) if len(xs) > 1 else (0.0, 0.0)
     if a <= 0:  # (a picture all of one lightness shows no slope: all of it is b)
@@ -188,22 +225,47 @@ class Denoised:
         self.scale = (2 / np.sqrt(slope)).astype(np.float32)
         self.offset = (floor / slope).astype(np.float32)
 
+    # (`into`, `camera` and `mixed` work in place, in one array each: the same arithmetic in
+    # the same order as written plainly, but every new array of a picture's size, and every
+    # sum over its three colors by numpy's reductions, cost as much as the arithmetic.)
+
     def into(self, part: np.ndarray) -> np.ndarray:
         """(h, w, 3) of the developed picture -> v, noise of one unit."""
-        cam = (part.astype(np.float32) / 65535) @ self.to_cam.T
-        return self.scale * np.sqrt(np.maximum(cam + self.offset, 0))
+        cam = part.astype(np.float32)
+        cam /= np.float32(65535)
+        cam = cam @ self.to_cam.T
+        cam += self.offset
+        np.maximum(cam, 0, out=cam)
+        np.sqrt(cam, out=cam)
+        cam *= self.scale
+        return cam
 
-    def camera(self, v: np.ndarray) -> np.ndarray:
-        """v -> the camera's own colors with its white balance on, 1 the sensor's white."""
-        return (np.maximum(v, 0) / self.scale) ** 2 - self.offset
+    def camera(self, v: np.ndarray, own: bool = False) -> np.ndarray:
+        """v -> the camera's own colors with its white balance on, 1 the sensor's white.
+        `own`: v is an array of no use afterwards, which becomes the result."""
+        out = np.maximum(v, 0, out=v if own else None)
+        out /= self.scale
+        np.square(out, out=out)
+        out -= self.offset
+        return out
 
     def mixed(self, rows: slice, color: float = 1.0, grain: float = 1.0) -> np.ndarray:
         """Those rows with these shares of what the net took kept away (1 and 1: the net's
-        own result; 0 and 0: the photo as it was), in the camera's colors, white balance on."""
+        own result; 0 and 0: the photo as it was), in the camera's colors, white balance on:
+        clean + (1 - grain) common + (1 - color) (removed - common), summed in that order."""
         clean = self.clean[rows]
-        removed = self.into(self.noisy[rows]) - clean
-        common = removed.mean(axis=2, keepdims=True)
-        return self.camera(clean + (1 - grain) * common + (1 - color) * (removed - common))
+        removed = self.into(self.noisy[rows])
+        removed -= clean
+        # (The mean of the three as numpy's mean has it, one after the other, then by 3.)
+        common = removed[..., 0] + removed[..., 1]
+        common += removed[..., 2]
+        common /= np.float32(3)
+        common = common[..., None]
+        out = clean + common * np.float32(1 - grain)
+        removed -= common
+        removed *= np.float32(1 - color)
+        out += removed
+        return self.camera(out, own=True)
 
     def picture(self) -> np.ndarray:
         """The net's own result as Photone shows a photo: (h, w, 4) half floats, linear
@@ -302,28 +364,55 @@ def run(path: Path, progress=None, stopped=None) -> Denoised:
     places = list(product(range(0, high, kept_), range(0, wide, kept_)))
     if progress:
         progress(0, len(places), net.where)
-    # The whole photo in the net's terms, once (in bands, on threads): the pieces are cut from it.
+    v, norm = _terms(held)
+    sigma = np.full((1, 1, 1, 1), norm, np.float32)
+
+    def cut(at: tuple[int, int]) -> np.ndarray:
+        return np.ascontiguousarray((_piece(v, *at, net.piece) * norm).transpose(2, 0, 1)[None])
+
+    # (Closed here, on this thread, however the loop ends: left to the exception's traceback,
+    # its thread would be shut down wherever that is let go, the interface's thread.)
+    with contextlib.closing(_ahead(cut, places)) as pieces:
+        for done, ((y, x), seen) in enumerate(zip(places, pieces, strict=True)):
+            if stopped and stopped():
+                raise Stopped
+            kept = held.clean[y:y + kept_, x:x + kept_]
+            kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[MARGIN:MARGIN + kept.shape[0],
+                                                               MARGIN:MARGIN + kept.shape[1]] / norm
+            held.where = net.where
+            if progress:
+                progress(done + 1, len(places), net.where)
+    return held
+
+
+def _terms(held: Denoised) -> tuple[np.ndarray, np.float32]:
+    """(the whole photo in the net's terms, once (in bands, on threads): the pieces are cut
+    from it; what it is multiplied by for the net, so that its median sits at MIDDLE)."""
+    noisy = held.noisy
     v = np.empty(noisy.shape, np.float32)
 
     def band(k: int) -> None:
-        rows = slice(high * k // 8, high * (k + 1) // 8)
+        rows = slice(len(noisy) * k // 8, len(noisy) * (k + 1) // 8)
         v[rows] = held.into(noisy[rows])
 
     with ThreadPoolExecutor(8) as bands:
         list(bands.map(band, range(8)))
-    norm = np.float32(MIDDLE / max(float(np.median(v[::4, ::4].mean(axis=2))), 1e-3))
-    sigma = np.full((1, 1, 1, 1), norm, np.float32)
-    for done, (y, x) in enumerate(places):
-        if stopped and stopped():
-            raise Stopped
-        seen = np.ascontiguousarray((_piece(v, y, x, net.piece) * norm).transpose(2, 0, 1)[None])
-        kept = held.clean[y:y + kept_, x:x + kept_]
-        kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[MARGIN:MARGIN + kept.shape[0],
-                                                           MARGIN:MARGIN + kept.shape[1]] / norm
-        held.where = net.where
-        if progress:
-            progress(done + 1, len(places), net.where)
-    return held
+    return v, np.float32(MIDDLE / max(float(np.median(v[::4, ::4].mean(axis=2))), 1e-3))
+
+
+def _ahead(cut, places: list):
+    """cut(place) of each place in turn, the next one cut on a thread of its own while the
+    one before is worked on: ONNX Runtime lets go of Python's lock while it runs, and cutting
+    a piece took 1.4 ms of the 29 a piece takes on the GPU."""
+    if not places:  # (a picture of no rows or no columns: nothing to cut)
+        return
+    with ThreadPoolExecutor(1) as ahead:
+        coming = ahead.submit(cut, places[0])
+        for n in range(len(places)):
+            seen = coming.result()
+            if n + 1 < len(places):
+                coming = ahead.submit(cut, places[n + 1])
+            yield seen
 
 
 def _piece(seen: np.ndarray, y: int, x: int, piece: int) -> np.ndarray:
@@ -366,8 +455,16 @@ def save(held: Denoised, path: Path, color: float = 1.0, grain: float = 1.0) -> 
 
     rows = upright
     if turns:  # (turned as a whole: the file's rows are the upright picture's columns)
-        whole = np.rot90(np.concatenate([upright(y, y + 512) for y in range(0, high, 512)]),
-                         -turns)
+        # (Mixed in bands on threads, as an unturned photo's strips are by dng.write: one
+        # band after another, it took as long as all the rest of the writing.)
+        upright_whole = np.empty(held.noisy.shape, np.float32)
+
+        def band(top: int) -> None:
+            upright_whole[top:top + 512] = upright(top, top + 512)
+
+        with ThreadPoolExecutor(8) as bands:
+            list(bands.map(band, range(0, high, 512)))
+        whole = np.rot90(upright_whole, -turns)
         rows = lambda top, bottom: whole[top:bottom]  # noqa: E731
 
     matrix = (held.from_cam * held.gain).tolist()  # what is stored -> Rec.2020, balance on
