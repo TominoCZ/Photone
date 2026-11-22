@@ -26,6 +26,12 @@ Windows 10 version 1903 or later (Qt loads the system's `icuuc.dll`) and a GPU w
 | `update-desktop-database` | `desktop-file-utils` | `./install.sh`: telling the desktop about the new menu entry at once | The entry shows up when the desktop next reads its menu |
 | `kscreen-doctor` | `libkscreen-bin` (part of Plasma) | Reading the display's HDR headroom, for the brightest the photo may get | A headroom of 2× white is assumed |
 
+## Pinned versions
+
+| Package | Pinned at | Why |
+|---|---|---|
+| rawpy | `==0.28.0` (LibRaw 0.22.2 inside) | Neural Denoise's net is trained on pictures developed by this LibRaw, in Neuro, from data built by Denoiser's `pairs_v2.py`. Its input in Photone must be developed the same way. A LibRaw with a changed demosaic or colour step would feed the net a picture it wasn't trained on. Neuro pins the same version, and its GPU copy of LibRaw's development matches 0.22.2 bit for bit. Upgrade both together, and only after Neuro's check against rawpy passes on the new version. |
+
 ## Development only (not shipped)
 
 | Dependency | Package | Used for |

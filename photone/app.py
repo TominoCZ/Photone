@@ -111,10 +111,13 @@ class Recent:
     one is better quickly, i always see the low quality render and have to wait for it to
     load every time"). Up to `room` bytes of them (a 33 MP photo is 330 MB in its two sizes),
     the one not looked at for longest let go first. A file that has changed since is not the
-    photo that was kept.
+    photo that was kept. The half sizes of the photos in `keep` (the open one and those
+    beside it, which PhotoView holds on the GPU) are not let go: a step there finds its
+    description here, and nothing would ask for the picture again.
 
     ponytail: the pictures are kept in memory, not on the GPU: one that is gone back to is
-    sent there again (some tens of milliseconds for 33 MP). The upgrade is to keep textures."""
+    sent there again (some tens of milliseconds for 33 MP), unless it is beside the open
+    photo (`Session.held`). The upgrade is to keep more textures."""
 
     def __init__(self, room: int | None = None) -> None:
         """`room`: unless told, a sixteenth of the machine's memory, 2 GB at most (six photos
@@ -124,7 +127,7 @@ class Recent:
         except (AttributeError, ValueError, OSError):
             memory = 16 << 30  # ponytail: Windows is not asked, 16 GB is assumed (so 1 GB here)
         self.room = min(2 << 30, memory // 16) if room is None else room
-        self.kept, self.lock = OrderedDict(), threading.Lock()
+        self.kept, self.lock, self.keep = OrderedDict(), threading.Lock(), set()
 
     def _held(self) -> int:
         return sum(what[1].sizeInBytes() for what in self.kept.values())
@@ -151,9 +154,13 @@ class Recent:
 
     def put(self, path: Path, half: bool, what: tuple) -> None:
         with self.lock:
-            self.kept[self._name(path, half)] = what
-            while len(self.kept) > 1 and self._held() > self.room:
-                self.kept.popitem(last=False)
+            self.kept[name := self._name(path, half)] = what
+            while self._held() > self.room:
+                old = next((n for n in self.kept
+                            if n != name and not (n[1] and n[0] in self.keep)), None)
+                if old is None:
+                    break
+                del self.kept[old]
 
 
 class Session(QObject):
@@ -180,6 +187,7 @@ class Session(QObject):
     LISTS = ("pins", "curve", "chroma", "eq", "bw", "grainCurve", "luts", "masks")
     photoChanged = Signal()  # another photo is shown: its view starts afresh
     described = Signal(int, object)  # from a loader thread: (generation, the photo's description)
+    heldChanged = Signal()  # other photos beside the open one can be drawn at once (`held`)
     denoiser = None     # the neural denoiser (make_view gives the session one)
     _denoised = False   # the open photo is a file the neural denoiser wrote
 
@@ -200,7 +208,11 @@ class Session(QObject):
         self.exporter, self.ahead, self._way, self._seen, self._listing = None, None, 1, -1, 0
         # (Once the open photo's own pictures are in, or after a while if one never comes:
         # until then nothing else is decoded, the photo asked for has the machine to itself.)
-        self.reader = QTimer(self, singleShot=True, interval=1500, timeout=self._read_ahead)
+        # (And `holder` looks again at what is `held`, while a photo beside the open one is
+        # still being decoded ahead.)
+        self.reader, self.holder = (
+            QTimer(self, singleShot=True, interval=1500, timeout=self._read_ahead),
+            QTimer(self, singleShot=True, interval=50, timeout=self._hold))
         self.changed.connect(self._lists)
         self.photos, self.load, self.settings, self.catalog = photos, load, settings, catalog
         self._index, self._generation = 0, 0
@@ -218,8 +230,11 @@ class Session(QObject):
         self.saver = QTimer(self, singleShot=True, interval=400, timeout=self.flush)
         self.described.connect(self._described)
         self.threads = ThreadPoolExecutor(2, "decode")  # a photo's two sizes at once
-        self.fetching, self.recent = {}, Recent()
-        self._open = [0]  # the generation of the photo on show, for a thread to look at
+        # (`held`, and what `ahead` has decoded or is decoding.)
+        self.fetching, self.recent, self._held, self._before = {}, Recent(), [], {}
+        # The generation of the photo on show, for a thread to look at; the same and its place
+        # among the photos, for Qt's image thread.
+        self._open, self._on = [0], (0, 0)
         self._fetch()
 
     def _start_scopes(self) -> None:
@@ -764,8 +779,11 @@ class Session(QObject):
 
     # ---- the photo ---------------------------------------------------------------------
 
-    def _address(self, size: str) -> str:
-        return f"image://photo/{self._generation}/{self._index}/{size}"
+    def _address(self, size: str, index: int | None = None) -> str:
+        """One address per photo and size while the photos at hand stay the same: PhotoView
+        keeps the half size of a photo beside the open one under it (`held`), and a step there
+        draws that, as it is."""
+        return f"image://photo/{self._listing}/{self._index if index is None else index}/{size}"
 
     @Property(str, notify=changed)
     def source(self) -> str:
@@ -773,7 +791,7 @@ class Session(QObject):
         half-size picture: quick to decode, and all a view of the whole photo needs. With
         the test chart on show it is the chart."""
         if self.photos and self._panels["chart"]:
-            return f"image://photo/{self._generation}/chart/half"
+            return f"image://photo/{self._listing}/chart/half"
         return self._address("half") if self.photos else ""
 
     @Property(str, notify=changed)
@@ -786,6 +804,32 @@ class Session(QObject):
         raw = self.photos and self.photos[self._index].suffix.lower() in decode.RAW
         seen = self._seen == self._generation
         return self._address("full") if raw and seen and not self._panels["chart"] else ""
+
+    @Property("QStringList", notify=heldChanged)
+    def held(self) -> list:
+        """The half-size pictures of the photos beside the open one that can be had at once
+        (kept, or decoded ahead): PhotoView keeps them on the GPU, so that a step there shows
+        the photo, through its edit, in the first frame after the key (the owner: "I would
+        like switching between photos ... to be instant")."""
+        return self._held
+
+    def _hold(self) -> None:
+        held = []
+        for at in (self._index + 1, self._index - 1):
+            if not 0 <= at < len(self.photos):
+                continue
+            path, address = self.photos[at], self._address("half", at)
+            ahead = self._before.get((path, True))
+            # (One held stays so while it is beside the open photo: on its way from the
+            # decoder to Qt it is in neither.)
+            if address in self._held or self.recent.has(path, True) or (
+                    ahead and ahead.done() and not ahead.cancelled() and not ahead.exception()):
+                held.append(address)
+            elif ahead and not ahead.done():  # (one that failed is not held, nor looked at again)
+                self.holder.start()
+        if held != self._held:
+            self._held = held
+            self.heldChanged.emit()
 
     @Property(str, notify=changed)
     def info(self) -> str:
@@ -898,13 +942,23 @@ class Session(QObject):
         self._inside = None
         self._redot()
         self.history = self._history()
-        self._generation += 1  # a new address, so a file opened twice is read twice
+        self._generation += 1
+        self._on = (self._generation, index)
         self._info, self._error, self._size = "", "", (0, 0)
+        here = self.photos[index]
+        self.recent.keep = set(self.photos[max(0, index - 1):index + 2])
         if self.ahead:  # this photo first: of what was decoded ahead, only what is near it stays
-            here = self.photos[index]
-            self.ahead([(here, True), (here, False), *self._near()], False)
+            self._before = self.ahead([(here, True), (here, False), *self._near()], False) or {}
+        self._hold()  # (before anyone is told: PhotoView keeps what it holds that is still wanted)
         self._fetch()
-        self.refresh()
+        # Kept from before (beside the photo that was open, or opened lately): its size and
+        # description are known at once, and a picture PhotoView holds is drawn as it is.
+        kept = self.recent.get(here, True)
+        if kept:
+            self._small = (self._generation, kept[2])
+            self._described(self._generation, kept[0])  # (and refreshes)
+        else:
+            self.refresh()
         self.photoChanged.emit()
 
     @Slot("QVariant")
@@ -999,7 +1053,8 @@ class Session(QObject):
         user is heading for in both sizes (264 MB for 33 MP: one full size, no more), and the
         quick pictures of the one after it and of the one behind."""
         if self.ahead:
-            self.ahead(self._near())
+            self._before = self.ahead(self._near()) or {}
+            self._hold()
 
     def _near(self) -> list:
         on, back = self._index + self._way, self._index - self._way
@@ -1016,8 +1071,11 @@ class Session(QObject):
         blank.fill(0)
         if generation in ("painted", "lut", "export", "mark", "denoised"):
             return self._other(generation, index, size) or blank
-        if int(generation) != self._generation:
-            return blank  # a photo the user has already left: not worth decoding
+        # A photo the user has already left, or the full size of one beside the open photo: not
+        # worth decoding. (The half size of one beside it is: PhotoView holds it, `held`.)
+        far = index != "chart" and abs(int(index) - self._index) > (size == "half")
+        if generation != str(self._listing) or far:
+            return blank
         if index == "chart":  # the test chart in the photo's place: no file, nothing to describe
             meta, pixels = decode.synthetic(*CHART)
             return QImage(pixels.buf, *CHART, CHART[0] * 8, QImage.Format.Format_RGBA16FPx4).copy()
@@ -1025,14 +1083,19 @@ class Session(QObject):
             meta, picture, small = self._picture(address, self.photos[int(index)], size != "full")
         except CancelledError:
             return blank  # left while this was being asked for
-        except (decode.Unreadable, IndexError) as e:
-            if int(generation) == self._generation:
+        except Exception as e:  # noqa: BLE001 - raised here, Qt drops it: a blank view, no word
+            if self._on[1] == int(index):
                 self._failed = True
-                self.say(str(e) or "no such photo")
+                known = isinstance(e, (decode.Unreadable, IndexError))
+                self.say(str(e) or "no such photo" if known else
+                         f"{self.photos[int(index)].name}: Photone could not read this file ({e})")
             return blank
-        self.described.emit(int(generation), meta)
-        if size == "half":
-            self._small = (int(generation), small)
+        # (Which photo is open, asked after the picture is kept: a step onto this one either
+        # comes after, and is told here, or finds it kept, `_show`.)
+        generation, at = self._on
+        if at == int(index):
+            self.described.emit(generation, meta)
+            self._small = (generation, small) if size == "half" else self._small
         return picture
 
     def _other(self, kind: str, which: str, size: str = "") -> QImage | None:
@@ -1073,8 +1136,8 @@ class Session(QObject):
 
     def _described(self, generation: int, meta: dict) -> None:
         """On the session's own thread: what the decoder found out about the photo shown."""
-        if generation != self._generation:
-            return  # a photo the user has since left
+        if generation != self._generation or self._seen == generation:
+            return  # a photo the user has since left, or told already
         self._size, self._seen = tuple(meta["full"]), generation
         # Its first picture is there: now its neighbors, ahead of being asked for. (On workers
         # of their own that give way: the full size of this one, still to come, is not held up.)
@@ -1134,7 +1197,12 @@ class Session(QObject):
         before = sum(photo in gone for photo in self.photos[:self._index])
         self.photos = [photo for photo in self.photos if photo not in gone]
         self._index = max(0, min(self._index - before, len(self.photos) - 1))
+        self._on = (self._generation, self._index)
+        # ponytail: the places, and so the addresses, are new: the open photo, kept, is read
+        # again from `recent` and shows its thumbnail for a moment. Rare (its neighbor's file
+        # went); the upgrade is addresses by file, not by place.
         self._relisted()  # (the new place first: QML asks for the open photo when told)
+        self._hold()
         if was and self.photos:
             return self._show(self._index)
         if was:  # nothing is left: no photo is open
@@ -1181,7 +1249,7 @@ class Session(QObject):
 
     def _without(self, tool: str) -> dict:
         """The edit without one tool's part: its settings doing nothing, which for most is
-        their rest and for some is not (edit.IDLE: a photo is sharpened a little at rest)."""
+        their rest and for some is not (edit.IDLE: the tone curve at rest is the photo's own)."""
         keys = edit.TOOLS.get(tool, ())
         return {**{k: v for k, v in self.history.edit.items() if k not in keys},
                 **{k: edit.IDLE[k] for k in keys if k in edit.IDLE}}

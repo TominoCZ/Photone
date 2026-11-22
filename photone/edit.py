@@ -56,10 +56,14 @@ DEFAULTS = {"profile": "standard", "temperature": None, "tint": None,
             "saturation": 100.0, "vibrance": 0.0, "chroma": STRAIGHT, "eq": [],
             "mono": False, "bw": FILMS["panchromatic"],
             "luts": [],
-            # (What a photo starts with of Detail is the owner's, set by eye on his photos: "these
-            # as defaults would be good". At 0 a setting is switched off, and kept as that.)
-            "sharpen": 20.0, "sharpenRadius": 1.0, "sharpenMask": 0.0,
-            "denoise": 10.0, "denoiseColor": 10.0,
+            # (Off until turned up. At 0 a setting is switched off: nothing of it is done, and
+            # the full-size picture it is kept in is not made, PhotoView's `detailed`. A photo
+            # started at 20, 10 and 10 at first, the owner's, set by eye on his photos: "these
+            # as defaults would be good"; and then, 2026-11-22: "sharpening and all noise
+            # reduction should be at 0 by default AND they should not take up VRAM at zero
+            # either". Edits kept from before say what they had: catalog.DETAIL_ON.)
+            "sharpen": 0.0, "sharpenRadius": 1.0, "sharpenMask": 0.0,
+            "denoise": 0.0, "denoiseColor": 0.0,
             # (Off until switched on. They were on at first, the owner's choice then: "i think
             # all should be switched on by default"; and then, 2026-11-20: "make these off
             # by default". Edits kept from before say that they had them on: catalog.LENS_ON.)
@@ -94,12 +98,13 @@ TOOLS = {"tone": ("profile", "exposure", "contrast", "brightness", "highlights",
          "lens": ("lensDistortion", "lensColor", "lensVignetting", "defringe"),
          "mono": ("bw",),  # (the look; black and white itself is a switch, no tool's setting)
          "crop": FRAME}
-# The settings that do something at rest (a photo is sharpened a little), and what they are
-# when they do nothing: what a card's A/B shows the photo with.
+# The settings that do something at rest, and what they are when they do nothing: what a
+# card's A/B shows the photo with. (Sharpening and noise reduction were here while a photo
+# started with a little of each.)
 # (The tone curve at rest is the photo's own, `curve_of`: held, the Exposure card's A/B shows
 # the photo with it straight, as shot. It showed the exposure a photo started lighter at,
 # which was the slider's start; the owner: "its a confusing design".)
-IDLE = {"sharpen": 0.0, "denoise": 0.0, "denoiseColor": 0.0, "curve": STRAIGHT}
+IDLE = {"curve": STRAIGHT}
 POINTS = 16     # of a tone curve: what the shader's three matrices hold
 GAP = 0.01      # the least two neighboring curve points are apart, left to right
 PINS = 12       # color pins a photo can have: what the shader's nine matrices hold

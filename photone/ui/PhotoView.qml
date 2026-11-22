@@ -8,13 +8,12 @@ Item {
     id: view
     clip: true
 
-    // There is a picture of the current photo to draw. Not "the Image is Ready": while the full
-    // size is being fetched the half-size picture stays on screen, and it must stay visible.
-    property bool have: false
+    // There is a picture of the current photo to draw: its first picture is in (or was held
+    // already, beside the photo before: then from the frame after the step on).
+    readonly property bool have: session.source !== "" && String(pixels.source) === session.source && pixels.status === Image.Ready
     property bool missing: false   // the photo's file is gone: nothing of it is shown, though a picture of it may still be held
     readonly property bool ready: have && !session.failed && !missing && session.fullWidth > 0
-    Connections { target: pixels; function onStatusChanged() { if (pixels.status === Image.Ready) view.have = true } }
-    Connections { target: session; function onPhotoChanged() { view.have = false } }
+    Connections { target: session; function onPhotoChanged() { view.brushedOnce = false; view.sharpFor = "" } }
 
     property bool fitted: true
     property real zoom: 1
@@ -43,7 +42,11 @@ Item {
     function glideFit() { if (!fitted) glideTo(fitZoom, width / 2, height / 2, true) }
     function still() { zooming.stop(); going = null }
     function land() { if (zooming.running) zooming.complete() }   // (for the audits: there at once)
+    // While no photo is shown (the next one still on its way, or unreadable) it has no size:
+    // a zoom or a move then measured by it put the middle of the view on a corner, at 100 %,
+    // and the photo came there. Only Fit is taken; the rest waits for the photo.
     function glideTo(z, x, y, toFit) {
+        if (!ready) return toFit ? fit() : undefined
         zooming.stop()
         // (Out of Fit first, looking the same: from here on it is a zoom and a place.)
         if (fitted) { zoom = fitZoom; fitted = false }
@@ -105,6 +108,7 @@ Item {
     // that was for the wheel's step onto Fit, which put the photo in the middle with a
     // jump; the wheel no longer goes onto Fit, and the gathering was itself a shift.
     function put(z, x, y, u, v, out) {
+        if (!ready) return
         const w = session.fullWidth * z, h = session.fullHeight * z
         const left = x - u * w, top = y - v * h
         fitted = false
@@ -114,6 +118,7 @@ Item {
     // Moving a fitted photo takes it out of Fit, at the size it has (Fit puts it back).
     function panBy(dx, dy) {
         still()
+        if (!ready) return
         if (fitted) { zoom = fitZoom; fitted = false }
         center = Qt.point(held(center.x - dx / photo.width), held(center.y - dy / photo.height))
     }
@@ -122,7 +127,7 @@ Item {
     // is what a view of the whole photo is drawn from. The sharp one (full size) is fetched
     // straight after it and used as soon as the view is closer than the first can show, so
     // crossing that line costs nothing: both are already there.
-    readonly property alias picture: pixels   // for the scopes' renders
+    readonly property var picture: pixels   // for the scopes' renders
     // The open photo's LUTs as the picture the shader reads them from, once it is there; else none.
     readonly property var lut: lutPixels.status === Image.Ready && lutPixels.sourceSize.width > 1 && String(lutPixels.source) !== "" ? lutPixels : null
     // (While another is being fetched there is none: the numbers that say where each LUT lies
@@ -131,19 +136,42 @@ Item {
     Image { id: lutPixels; source: session.lutSource; asynchronous: true; cache: false; visible: false }
     readonly property var sharpest: sharpReady ? sharpPixels : pixels   // every pixel of the photo, once it is there (the grain's loupe)
     readonly property bool sharpThere: sharpReady
-    Image {
-        id: pixels
-        source: session.source
-        asynchronous: true; cache: false; mipmap: true; visible: false
-        retainWhileLoading: true
+    // The first pictures of the open photo and of the photos either side of it (`session.held`),
+    // each kept by one of these three while it is wanted: a step to a photo beside the open one
+    // draws its picture, already on the GPU, in the first frame after the key, where its
+    // thumbnail stood in for some 40 ms (the owner: "I would like switching between photos ...
+    // to be instant"). The one that has the open photo's is `pixels`. Each draws one pixel just
+    // outside this view's edge, so that Qt sends it to the GPU now, not at the step.
+    // ponytail: two first pictures more on the GPU, 87 MB each for 33 MP (half size, floats,
+    // mipmaps), more for a JPEG, which has only its full size. Fast stepping outruns them.
+    readonly property string wanted: [session.source, ...session.held].join(" ")
+    onWantedChanged: if (built) hold()
+    // (Not before the three are whole: a source set while `asynchronous` was not yet, was
+    // asked for at once, and the window, waiting for Qt's image thread, never opened.)
+    property bool built: false
+    Component.onCompleted: { built = true; hold() }
+    function hold() {
+        const want = wanted.split(" ").filter(a => a !== ""), holds = [held0, held1, held2]
+        const free = holds.filter(h => !want.includes(String(h.source)))
+        for (const a of want) if (!holds.some(h => String(h.source) === a)) free.shift().source = a
+        for (const h of free) h.source = ""
     }
+    readonly property Image pixels: [held0, held1, held2].find(h => String(h.source) === session.source) || held0
+    component Held: Image { x: -2; y: -2; width: 1; height: 1; asynchronous: true; cache: false; mipmap: true }
+    Held { id: held0 }
+    Held { id: held1 }
+    Held { id: held2 }
     Image {
         id: sharpPixels
-        // Asked for once the first picture is there: Qt fetches one at a time, in no promised
-        // order, and the first must not wait behind this one. (Its decoding runs regardless.)
-        source: view.have ? session.fullSource : ""
+        // Asked for in the frame after the first picture is shown: Qt fetches one at a time,
+        // in no promised order, and the first must not wait behind this one; and the two sent
+        // to the GPU in one frame made it 110 to 125 ms long, the photo shown only after it.
+        // (Its decoding runs regardless.)
+        source: view.sharpFor === session.source ? session.fullSource : ""
         asynchronous: true; cache: false; visible: false
     }
+    property string sharpFor: ""   // the photo (its first picture) whose sharp one is asked for
+    FrameAnimation { running: view.have && view.sharpFor !== session.source; onTriggered: view.sharpFor = session.source }
     // Sharpening and noise reduction done once over every pixel of the photo, and kept: seen
     // from further than 100 %, the photo is drawn from this (pipeline.frag, `detailKept`),
     // made smaller through its mipmaps as an export made smaller would be. Done there per pixel
@@ -156,7 +184,9 @@ Item {
     // (16-bit floats and mipmaps: 256 MB at 24 MP), made anew on each going out past 100 % and
     // at each change of a Detail slider. The upgrade, should a pass over all of it be too slow
     // on a large file, is to do it over the part of the photo in view only.
-    // (Not until the full-size picture is there: until then the photo is as it was.)
+    // (Not until the full-size picture is there: until then the photo is as it was. Nor while
+    // all of them are at 0, as a photo starts: then there is nothing to keep, and no 350 MB
+    // and depth buffer at 33 MP; the owner: "they should not take up VRAM at zero either".)
     Pipeline {
         id: detailed
         objectName: "detailed"
@@ -172,6 +202,7 @@ Item {
         sharpen: photo.sharpen; sharpenRadius: photo.sharpenRadius; sharpenMask: photo.sharpenMask
         denoise: photo.denoise; denoiseColor: photo.denoiseColor; denoiseFar: photo.denoiseFar
         layer.enabled: view.ready && view.visible && photo.width < session.fullWidth && view.sharpest.sourceSize.width >= session.wide - 1
+                       && (photo.sharpen > 0 || photo.denoise > 0 || photo.denoiseColor > 0)
         layer.textureSize: Qt.size(width, height); layer.format: ShaderEffectSource.RGBA16F
         layer.mipmap: true; layer.smooth: true
     }
@@ -309,7 +340,7 @@ Item {
                 objectName: "brush-mix"
                 width: brush.raster.width; height: brush.raster.height; visible: false
                 property var state: kept
-                property var base: view.brushedThere ? brushed : pixels
+                property var base: view.brushedThere ? brushed : view.pixels
                 property real based: view.brushedThere ? 1 : 0
                 property real channel: brush.channel
                 property real erase: brush.erase
@@ -332,7 +363,7 @@ Item {
         width: Math.round(session.fullWidth * view.shown * view.cropBy); height: Math.round(session.fullHeight * view.shown * view.cropBy)
         x: Math.round(view.width / 2 - view.center.x * width + view.cropOff.x)
         y: Math.round(view.height / 2 - view.center.y * height + view.cropOff.y)
-        source: pixels; painted: view.painted; lutPicture: view.lut
+        source: view.pixels; painted: view.painted; lutPicture: view.lut
         sharp: detailed.on ? detailed : view.sharpest
         useSharp: view.useSharp || detailed.on ? 1 : 0
         detailKept: detailed.on ? 1 : 0
@@ -365,7 +396,7 @@ Item {
         Pipeline {
             objectName: "photo-before"
             width: photo.width; height: photo.height
-            source: pixels; sharp: view.sharpest; useSharp: view.useSharp ? 1 : 0; crisp: photo.crisp   // (the original: not `detailed`)
+            source: view.pixels; sharp: view.sharpest; useSharp: view.useSharp ? 1 : 0; crisp: photo.crisp   // (the original: not `detailed`)
             edit: follows ? session.before : null
         }
     }

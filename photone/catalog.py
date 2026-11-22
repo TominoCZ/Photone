@@ -33,9 +33,12 @@ from photone import edit
 # until switched on; edits kept before, which had them on unless they said otherwise, say so
 # now. 7: Exposure starts at 0 and the tone curve at the raw file's own (edit.curve_of);
 # edits of raw files kept before, which had the curve straight and Exposure where version 5
-# started it (so did 6), say so now.
-VERSION = 7
+# started it (so did 6), say so now. 8 (2026-11-22): sharpening and noise reduction are off
+# until turned up; edits kept before, of every kind of file, which had 20, 10 and 10 unless
+# they said otherwise, say so now.
+VERSION = 8
 LENS_ON = {"lensDistortion": True, "lensColor": True, "lensVignetting": True}
+DETAIL_ON = {"sharpen": 20.0, "denoise": 10.0, "denoiseColor": 10.0}
 PIECE = 64 * 1024
 # What a photo can be marked, and how far: rejected to picked, no stars to five, no label to
 # the fifth color.
@@ -210,7 +213,8 @@ class Catalog:
                 self.db.execute("CREATE INDEX IF NOT EXISTS same_content ON edits (content)")
                 self.db.executescript(LIBRARY)
                 if 0 < found < VERSION:  # (where Exposure started then: 0 before version 3)
-                    start = {3: _taken_back, 4: _held_back, 5: _by_picture, 6: _by_picture}
+                    start = {3: _taken_back, 4: _held_back, 5: _by_picture, 6: _by_picture,
+                             7: lambda at: None}  # (0 since 7, as now: nothing to write)
                     self._keep(start.get(found, lambda at: 0.0), found)
                 self.db.execute(f"PRAGMA user_version={VERSION}")
         except (sqlite3.Error, OSError) as e:
@@ -222,10 +226,13 @@ class Catalog:
         compensation taken back in version 3; as far as the picture had room for it in
         version 4; by the picture alone in versions 5 and 6; 0 again since. The lens
         corrections once: on before version 6, off since. The tone curve once: straight
-        before version 7, the raw file's own since. So that no photo looks other than it was
-        left, an edit kept under an older rule has them written out as they were then: its
-        Exposure `start(path)` (or nothing where that cannot be known any more); for a raw
-        file, the straight curve and, before version 6, the corrections on (`LENS_ON`). A
+        before version 7, the raw file's own since. Sharpening and noise reduction once: 20,
+        10 and 10 before version 8, 0 since. So that no photo looks other than it was left, an
+        edit kept under an older rule has them written out as they were then: its Exposure
+        `start(path)` (or nothing where that cannot be known any more); for a raw file, before
+        version 7 the straight curve and before version 6 the corrections on (`LENS_ON`); for
+        every file, before version 8 its Detail (`DETAIL_ON`; a file the neural denoiser
+        wrote is given its noise reduction too, which it is never done to, `edit.uniforms`). A
         photo with no edit at all is left so: it starts as any untouched photo does. (Version
         6's own round wrote the corrections into edits and checkpoints of every kind of file
         and not into the undo steps, which then no longer ended where their edit stood and
@@ -255,7 +262,8 @@ class Catalog:
         for key, path, values, marks, states, _ in found_rows:
             raw = bool(path) and Path(path).suffix.lower() in decode.RAW
             was = starts.get(path)
-            then = {**(LENS_ON if found < 6 else {}), "curve": edit.STRAIGHT} if raw else {}
+            then = {**DETAIL_ON, **(LENS_ON if raw and found < 6 else {}),  # (all before 8)
+                    **({"curve": edit.STRAIGHT} if raw and found < 7 else {})}
             undone = {**LENS_ON, **then} if found == 6 and values else then
 
             def as_it_was(values, was=was, then=then) -> dict:

@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -103,13 +104,15 @@ def check_session() -> None:
     changes = []
     session.photoChanged.connect(lambda: changes.append(session.source))
     session.step(1)
-    assert changes == ["image://photo/1/1/half"] and session.info == ""
+    assert changes == ["image://photo/0/1/half"] and session.info == ""
     session.step(1)
     session.step(-5)
-    assert changes[-1] == "image://photo/2/0/half" and len(changes) == 2, "stops at the ends"
-    # A late answer for a photo the user has left changes nothing about the one shown.
-    assert session.image("0/1/half").width() == 1, "nor is it decoded at all"
-    assert session.info == "", "the old photo's size must not land on the new one"
+    assert changes[-1] == "image://photo/0/0/half" and len(changes) == 2, "stops at the ends"
+    assert session.info == "a.arw  ·  16 × 8", "kept from before: known at the step"
+    # A late answer for a photo the user has left changes nothing about the one shown; the
+    # full size of one beside it is not decoded at all, its half size is (PhotoView holds it).
+    assert session.image("0/1/full").width() == 1 and session.image("0/1/half").width() == 8
+    assert session.info == "a.arw  ·  16 × 8", "the other photo's size must not land on this one"
 
     def integers(path: Path, half: bool):  # as the raw decoder hands them over
         buf = bytearray(2 * 1 * 8)
@@ -133,6 +136,10 @@ def check_session() -> None:
     assert broken.image("0/0/half").width() == 1 and broken.failed, "unreadable is a state"
     assert broken.error == "b.arw: damaged", "and a sentence, never an exception"
     assert app.Session([]).image("0/3/half").width() == 1, "a wrong index does not raise either"
+    # A fault of the decoder's own, not a file it knows to be bad: a sentence all the same
+    # (raised out of `image`, Qt dropped it: the photo stayed blank, with no word why).
+    buggy = app.Session([Path("c.dng")], load=lambda path, half: {}["width"])
+    assert buggy.image("0/0/half").width() == 1 and buggy.failed and buggy.error.startswith("c.dng: ")
 
     # SDR | HDR: the surface is a fact about the window, the switch a choice on top of it.
     fresh = app.Session([])
@@ -315,7 +322,8 @@ def check_no_orphan() -> None:
 
 CAMERA = decode.synthetic(8, 4)[0]["camera"]  # a real camera's figures
 ON = catalog.LENS_ON  # what an edit kept before the lens corrections were off at rest says
-THEN = {**ON, "curve": edit.STRAIGHT}  # and one of a raw file, kept before its curve was its own
+DETAIL = catalog.DETAIL_ON  # and one of any file, kept before Detail was 0 at rest
+THEN = {**ON, "curve": edit.STRAIGHT, **DETAIL}  # and one of a raw file, kept before its curve was its own
 
 
 def check_edit_values() -> None:
@@ -632,9 +640,10 @@ def check_detail() -> None:
     """Sharpening and noise reduction (photone/edit.py): their settings, and the numbers the
     shader is handed, which go by the size of the stored picture."""
     rest = edit.uniforms({}, None, True, shape=1.5, wide=6000)
-    assert rest["sharpen"] == 0.2 and abs(rest["denoise"] - 0.1 ** 1.5 * 0.07) < 1e-12 and rest["denoiseColor"] == 0.025, "what a photo starts with: the owner's"
-    none = edit.uniforms({"sharpen": 0.0, "denoise": 0.0, "denoiseColor": 0.0}, None, True, shape=1.5, wide=6000)
-    assert none["sharpen"] == 0 and none["denoise"] == 0 and none["denoiseColor"] == 0 and edit.clean({"sharpen": 0, "denoise": 10}) == {"sharpen": 0.0}, "0 is off, and is kept"
+    assert rest["sharpen"] == 0 and rest["denoise"] == 0 and rest["denoiseColor"] == 0 and rest["denoiseFar"] == 0, "a photo starts with none of it: the owner's"
+    some = edit.uniforms({"sharpen": 20.0, "denoise": 10.0, "denoiseColor": 10.0}, None, True, shape=1.5, wide=6000)
+    assert some["sharpen"] == 0.2 and abs(some["denoise"] - 0.1 ** 1.5 * 0.07) < 1e-12 and some["denoiseColor"] == 0.025
+    assert edit.clean({"sharpen": 0, "denoise": 10}) == {"denoise": 10.0}, "0 is off, and at rest"
     assert rest["detailX"] == 1 / 6000 and abs(rest["detailY"] - 1 / 4000) < 1e-12, "a pixel of the picture, as a share of it"
     u = edit.uniforms({"sharpen": 80.0, "sharpenRadius": 2.0, "sharpenMask": 50.0, "denoise": 100.0, "denoiseColor": 40.0}, None, True, shape=1.5, wide=6000)
     assert u["sharpen"] == 0.8 and u["sharpenRadius"] == 2 and u["sharpenMask"] == 0.025 and abs(u["denoise"] - 0.07) < 1e-12 and abs(u["denoiseColor"] - (0.025 + 30 / 90 * 0.035)) < 1e-12 and abs(u["denoiseFar"] - 1 / 3) < 1e-12
@@ -644,7 +653,7 @@ def check_detail() -> None:
     assert edit.uniforms({"denoiseColor": 100.0}, None, True, wide=6000)["denoiseFar"] == 1
     blind = edit.uniforms({"sharpen": 80.0, "denoise": 100.0, "denoiseColor": 40.0}, None, True)
     assert blind["sharpen"] == 0 and blind["denoise"] == 0 and blind["denoiseColor"] == 0 and blind["detailX"] == 0, "without the picture's size: none of it"
-    assert edit.clean({"sharpen": 500, "sharpenRadius": 0.1, "denoise": -3, "denoiseColor": "much"}) == {"sharpen": 150.0, "sharpenRadius": 0.5, "denoise": 0.0}
+    assert edit.clean({"sharpen": 500, "sharpenRadius": 0.1, "denoise": -3, "denoiseColor": "much"}) == {"sharpen": 150.0, "sharpenRadius": 0.5}
     assert edit.look_of({"sharpen": 40.0, "denoise": 20.0}, ["detail"]) == {"sharpen": 40.0, "denoise": 20.0} and "sharpen" not in edit.look_of({"sharpen": 40.0}, ["light"])
 
 
@@ -1499,7 +1508,7 @@ def check_catalog_before_compensation() -> None:
             edits = {key: json.loads(kept.db.execute("SELECT edit FROM edits WHERE key = ?", (key,)).fetchone()[0]) for key, *_ in rows}
             assert edits["c1:aa:1"] == {"contrast": 30.0, "exposure": 1.3, **THEN}, "an edit of version 3 keeps the start it had"
             assert edits["c1:bb:1"] == {"exposure": 0.2, **THEN} and edits["c1:cc:1"] == {}, "a named Exposure stays; no edit takes the new start"
-            assert edits["c1:dd:1"] == {"contrast": 30.0, **THEN} and edits["c1:ee:1"] == edits["c1:ff:1"] == {"contrast": 30.0}, "a file that is gone, a finished picture, no path: left alone"
+            assert edits["c1:dd:1"] == {"contrast": 30.0, **THEN} and edits["c1:ee:1"] == edits["c1:ff:1"] == {"contrast": 30.0, **DETAIL}, "a file that is gone, a finished picture, no path: left alone (but for Detail, of every file)"
             assert [p["edit"] for p in kept.checkpoints("c1:aa:1")] == [{"shadows": 20.0, "exposure": 1.3, **THEN}]
             kept.close()
         assert path.with_name("catalog.db.v3").exists(), "the file as it was is kept beside it"
@@ -1523,7 +1532,7 @@ def check_catalog_before_compensation() -> None:
         edits = {key: json.loads(stored) for key, stored in kept.db.execute("SELECT key, edit FROM edits")}
         assert edits == {"c1:aa:1": {"contrast": 30.0, "exposure": 0.45, **THEN}, "c1:bb:1": {"exposure": 0.2, **THEN},
                          "c1:cc:1": {"contrast": 30.0, **THEN}, "c1:dd:1": {}}, f"edits of version 4 keep the start they had: {edits}"
-        assert kept.db.execute("PRAGMA user_version").fetchone()[0] == catalog.VERSION == 7 and path.with_name("catalog.db.v4").exists()
+        assert kept.db.execute("PRAGMA user_version").fetchone()[0] == catalog.VERSION == 8 and path.with_name("catalog.db.v4").exists()
         kept.close()
     # And one of version 5, where Exposure started by the picture alone (`_start_5`), the
     # curve was straight and the lens corrections on unless an edit said otherwise: edits,
@@ -1551,7 +1560,7 @@ def check_catalog_before_compensation() -> None:
             catalog._by_picture = asked
         edits = {key: json.loads(stored) for key, stored in kept.db.execute("SELECT key, edit FROM edits")}
         assert edits == {"c1:aa:1": {"contrast": 30.0, "exposure": 0.45, **THEN}, "c1:bb:1": {**THEN, "lensColor": False, "exposure": 0.0},
-                         "c1:cc:1": {}, "c1:dd:1": {"contrast": 30.0}}, edits
+                         "c1:cc:1": {}, "c1:dd:1": {"contrast": 30.0, **DETAIL}}, edits
         assert [p["edit"] for p in kept.checkpoints("c1:aa:1")] == [{"exposure": 0.45, **THEN}], "a checkpoint at rest then is written out too"
         history = edit.History(kept.load("c1:aa:1", Path("/there.arw")), kept.steps("c1:aa:1"))
         assert history.at == 1 and history.states[0] == {"exposure": 0.45, **THEN}, "undo carries on, to the photo as it was"
@@ -1578,14 +1587,39 @@ def check_catalog_before_compensation() -> None:
         finally:
             catalog._by_picture = asked
         edits = {key: json.loads(stored) for key, stored in kept.db.execute("SELECT key, edit FROM edits")}
-        assert edits == {"c1:aa:1": {"contrast": 30.0, "exposure": 0.45, "curve": edit.STRAIGHT},
-                         "c1:bb:1": {"lensColor": True, "exposure": 1.0, "curve": edit.STRAIGHT}, "c1:cc:1": {**ON, "contrast": 30.0}}, edits
+        assert edits == {"c1:aa:1": {"contrast": 30.0, "exposure": 0.45, "curve": edit.STRAIGHT, **DETAIL},
+                         "c1:bb:1": {"lensColor": True, "exposure": 1.0, "curve": edit.STRAIGHT, **DETAIL}, "c1:cc:1": {**ON, "contrast": 30.0, **DETAIL}}, edits
         history = edit.History(kept.load("c1:cc:1", Path("/done.jpg")), kept.steps("c1:cc:1"))
-        assert history.at == 1 and history.states[0] == ON, "its undo steps end where its edit stands again"
+        assert history.at == 1 and history.states[0] == {**ON, **DETAIL}, "its undo steps end where its edit stands again"
         kept.close()
     assert catalog._held_back(None) is None and catalog._held_back("/no/such/file.arw") is None and catalog._held_back("/a/picture.jpg") is None
     assert catalog._start_4(0.7, [0.01, 0.02]) == 0.7 and catalog._start_4(0.0, [0.01, 0.02]) == 0, "version 4: never more than the camera was set under"
     assert catalog._start_4(1.3, [0.04, 0.1]) == 0.58 and catalog._start_4(5.0, [0.0001, 0.001]) == 3.0 and catalog._start_4(1.0, None) == 0
+
+
+def check_catalog_before_detail() -> None:
+    """Version 7: Detail was 20, 10 and 10 at rest. An edit of any file that names none of it
+    had that, and says so now; what it named stays (0 too); nothing else is written out (the
+    curve and Exposure have been at rest as now since 7); a photo with no edit starts at 0."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "catalog.db"
+        catalog.Catalog(path).close()
+        old = sqlite3.connect(path)
+        with old:
+            mark = json.dumps([{"id": 1, "name": "One", "made": 1.0, "edit": {"shadows": 20.0}}])
+            for key, where, stored in (("c1:aa:1", "/there.arw", '{"contrast": 30.0}'), ("c1:bb:1", "/done.jpg", '{"sharpen": 0.0, "denoise": 40.0}')):
+                old.execute("INSERT INTO edits VALUES (?, ?, ?, ?, 1, ?)", (key, key.split(":")[1], where, stored, mark))
+            old.execute("INSERT INTO steps VALUES ('c1:aa:1', ?, 1)", (json.dumps([{}, {"contrast": 30.0}]),))
+            old.execute("PRAGMA user_version=7")
+        old.close()
+        kept = catalog.Catalog(path)
+        assert kept.load("c1:aa:1", Path("/there.arw")) == {"contrast": 30.0, **DETAIL}, "an edit of before looks as it did"
+        assert kept.load("c1:bb:1", Path("/done.jpg")) == {"denoise": 40.0, "denoiseColor": 10.0}, "a JPEG too; its 0 (at rest now) and its 40 stay"
+        assert [p["edit"] for p in kept.checkpoints("c1:aa:1")] == [{"shadows": 20.0, **DETAIL}]
+        history = edit.History(kept.load("c1:aa:1", Path("/there.arw")), kept.steps("c1:aa:1"))
+        assert history.at == 1 and history.states[0] == DETAIL, "undo carries on, to the photo as it was"
+        assert kept.load("c1:zz:1", Path("/new.arw")) == {} and edit.uniforms({}, None, True, wide=6000)["sharpen"] == 0, "a photo with no edit starts at 0"
+        kept.close()
 
 
 def check_saved() -> None:
@@ -1874,12 +1908,17 @@ def check_session_tools() -> None:
     assert seen["contrast"] == 0 and seen["shadows"] == 0 and seen["curveOn"] == 0, "without Tone (its curve too), and only Tone"
     session.setBypass("")
     assert session.uniforms["contrast"] > 0
-    # A card whose settings do something at rest: its A/B shows the photo without them, and
-    # is there to be held though nothing of the card was changed.
-    assert session.uniforms["sharpen"] > 0 and not session.adjusted["detail"] and session.comparable["detail"] and not session.comparable["eq"]
+    # Detail at rest does nothing (all of it at 0): no dot, no A/B. Turned up, its A/B shows
+    # the photo without it.
+    assert session.uniforms["sharpen"] == 0 and not session.adjusted["detail"] and not session.comparable["detail"] and not session.comparable["eq"]
+    session.setEdits({"sharpen": 30.0, "denoise": 10.0})
+    assert session.adjusted["detail"] and session.comparable["detail"] and session.uniforms["sharpen"] == 0.3
     session.setBypass("detail")
     assert session.uniforms["sharpen"] == 0 and session.uniforms["denoise"] == 0 and session.uniforms["denoiseColor"] == 0
     session.setBypass("")
+    session.setEdits({"sharpen": 0.0, "denoise": 0.0})
+    session.commitEdit()  # (there and back: no step)
+    assert not session.adjusted["detail"]
     assert not session.comparable["lens"], "nothing of the Lens card is on: nothing to compare"
     steps = session.history.at
     session.resetTool("tone")
@@ -2731,6 +2770,17 @@ def check_kept() -> None:
     none = dict(canon, crop_left_margin=65535, crop_top_margin=65535, crop_width=0, crop_height=0)
     rows, columns = decode.kept(Sizes(**none, flip=5), False)
     assert (span(rows), span(columns)) == ((0, 5208), (0, 3476)), "no part named: all of it"
+    picture, full = decode.trimmed(np.zeros((1738, 2604, 3)), Sizes(**canon, flip=0), True)
+    assert picture.shape[:2] == (1728, 2592) and full == (5184, 3456), (picture.shape, full)
+    # A SuperCCD: LibRaw's sizes say a square, what it develops is turned back 45° from it.
+    fuji = dict(width=3584, height=3583, left_margin=32, top_margin=24, crop_left_margin=0,
+                crop_top_margin=0, crop_width=0, crop_height=0, flip=6)
+    for half, shape, size in ((False, (2035, 3032), (3032, 2035)), (True, (1018, 1516), (3032, 2036))):
+        picture, full = decode.trimmed(np.zeros((*shape, 3)), Sizes(**fuji), half)
+        assert picture.shape[:2] == shape and full == size, (half, picture.shape, full)
+    # Asked for half size, given the full one (a Sony's medium lossless raw): cut as the full one.
+    picture, full = decode.trimmed(np.zeros((3476, 5208, 3)), Sizes(**canon, flip=0), True)
+    assert picture.shape[:2] == (3456, 5184) and full == (5184, 3456), (picture.shape, full)
 
 
 def check_denoise() -> None:
@@ -2791,11 +2841,12 @@ def check_denoise() -> None:
             assert dng._entries(file, 8, ">")[0x8827] == (3, 1, struct.pack("<H", 6400)), "big-endian"
         other.unlink()
         assert denoise.target(raw).name == "shot-Denoised.dng"
+        held.model = denoise.models()["developed"]
         out = denoise.save(held, raw, 0.7, 0.4)
         assert out.name == "shot-Denoised.dng" and denoise.target(raw).name == "shot-Denoised-2.dng", "never written over"
         assert not list(Path(folder).glob("*.part"))
         made = dng.made_here(out)
-        assert made == {"model": denoise.MODEL.stem, "color": 0.7, "grain": 0.4, "from": "shot.ARW",
+        assert made == {"model": held.model.stem, "color": 0.7, "grain": 0.4, "from": "shot.ARW",
                         "of": catalog.identify(raw)}, made
         assert made["of"].startswith("c1:") and made["of"] != catalog.identify(out), "the original's fingerprint, not its own"
         assert dng.made_here(raw) is None and dng.made_here(Path(folder) / "none.dng") is None
@@ -2859,7 +2910,79 @@ def check_denoise() -> None:
     assert denoise.known((4688, 7028), 12800) == (12800 * 0.002175, 1114.4) and denoise.known((10, 10), 100) is None
     a, b = denoise.of_mosaic(rng.normal(500, 10, (640, 960)))  # (flat, noise of 10: all of it is b)
     assert 60 < a * 500 + b < 160, (a, b)
-    assert denoise.MODEL.exists() and denoise.MODEL.stat().st_size > 1 << 20, "the net comes with the program"
+    shipped = denoise.models()["developed"]
+    assert shipped and shipped.stat().st_size > 1 << 20, "the net comes with the program"
+
+
+class _Sensor:
+    """What rawpy tells of a raw file that a raw net needs, for a made-up mosaic: its colors
+    in `order` (a 2 x 2 cell of 0 red, 1 green, 2 blue, 3 the second green), a black of 512."""
+
+    def __init__(self, scene: np.ndarray, order: tuple, room: float = 15000.0) -> None:
+        h, w = scene.shape[:2]
+        self.color_desc, self.raw_pattern = b"RGBG", np.array(order).reshape(2, 2)
+        self.raw_colors_visible = np.tile(self.raw_pattern, (h // 2 + 1, w // 2 + 1))[:h, :w]
+        plane = np.array([0, 1, 2, 1])[self.raw_colors_visible]
+        seen = np.take_along_axis(scene, plane[..., None], 2)[..., 0]
+        self.raw_image_visible = np.round(seen * room + 512).astype(np.uint16)
+        self.black_level_per_channel, self.white_level = [512] * 4, int(room + 512)
+
+
+def check_denoise_kinds() -> None:
+    """The two kinds of net (Neuro's PLAN.md §4.40): each told by its file; which one a photo
+    gets and why; a raw net (one that only demosaics, tests/raw-demosaic-256.onnx) given a
+    made-up mosaic in every Bayer order and turned every way, its result the picture's own in
+    the net's terms (its red is red, wherever it lies); and X-Trans's noise read off its mosaic."""
+    with tempfile.TemporaryDirectory() as folder:
+        for f in (Path(__file__).parent / "raw-demosaic-256.onnx", denoise.models()["developed"]):
+            shutil.copy(f, folder)
+        found = denoise.models(Path(folder))
+        assert found["sensor"].name == "raw-demosaic-256.onnx" and found["developed"].suffix == ".onnx", found
+        assert denoise.model(found["sensor"]) == {"raw": True, "piece": 256, "margin": 96}
+        assert denoise.model(found["developed"]) == {"raw": False, "piece": 768, "margin": 128}
+        assert denoise.models(Path(folder) / "none") == {"sensor": None, "developed": None}
+        sensed = {"sensed": {}}
+        assert denoise.chosen(sensed, found) == ("sensor", "", found["sensor"])
+        assert denoise.chosen({"why": "pattern"}, found) == ("developed", "pattern", found["developed"]), "X-Trans: the older net"
+        assert denoise.chosen({}, {**found, "sensor": None}) == ("developed", "missing", found["developed"]), "no raw net installed"
+        held = {"sensed": {"mosaic_size": (40, 60)}}
+        denoise._fit(held, (40, 61, 3), types.SimpleNamespace(flip=0))
+        assert held == {"why": "layout"}, "LibRaw's picture not the sensor's size: the older net"
+        net = denoise._Net(found["sensor"])
+    cam_xyz = [[0.746, -0.2365, -0.0588], [-0.5687, 1.3442, 0.2474], [-0.0624, 0.1156, 0.6584]]
+    y, x = np.mgrid[0:150, 0:230].astype(np.float32)
+    scene = np.stack([0.05 + 0.3 * x / 230, np.full_like(x, 0.2), 0.04 + 0.2 * y / 150], 2)  # (camera colors)
+    for order, turn in (((0, 1, 3, 2), 0), ((1, 0, 2, 3), 1), ((2, 3, 1, 0), 2), ((3, 2, 0, 1), 3)):
+        sensed = denoise._sensed(_Sensor(scene, order))["sensed"]
+        flip = {0: 0, 1: 5, 2: 3, 3: 6}[turn]
+        size = (230, 150) if turn % 2 else (150, 230)
+        sizes = types.SimpleNamespace(flip=flip, width=230, height=150, crop_width=0, crop_height=0,
+                                      crop_left_margin=0, left_margin=0, crop_top_margin=0, top_margin=0)
+        about = {"wb": [2.4, 1.0, 1.6], "cam_xyz": cam_xyz, "a": 2.0, "b": 30.0, "room": 15000.0, "sensed": sensed}
+        denoise._fit(about, (*size, 3), sizes)
+        held = denoise.Denoised(np.zeros((*size, 3), np.uint16), about)
+        v, norm = denoise._sensor_terms(held, sensed)
+        out = np.empty((*v.shape[:2], 3), np.float32)
+        denoise._pieces(net, v, norm, norm, out, held, None, None)
+        denoise._upright(held, sensed, out)
+        # (each color of the picture in the net's terms: `sensed` of a mosaic all of that color)
+        want = np.rot90(np.stack([_own(held, scene, c) for c in range(3)], 2), turn)
+        off = np.abs(held.clean - want) / want
+        assert held.clean.shape == want.shape and np.median(off) < 0.005 and np.percentile(off, 99) < 0.05, (order, turn, np.median(off), np.percentile(off, 99))
+    # X-Trans: its colors repeat every 6 x 6, and its noise is read 6 apart, not 2.
+    rng, xtrans = np.random.default_rng(5), np.array([[1, 1, 0, 1, 1, 2], [1, 1, 2, 1, 1, 0], [2, 0, 1, 0, 2, 1],
+                                                      [1, 1, 2, 1, 1, 0], [1, 1, 0, 1, 1, 2], [0, 2, 1, 2, 0, 1]])
+    signal = np.array([800.0, 1500.0, 500.0])[np.tile(xtrans, (120, 160))] * np.linspace(0.3, 1.5, 960)[None, :]
+    noisy = signal + np.sqrt(2.0 * signal + 40) * rng.standard_normal(signal.shape)
+    a, b = denoise.of_mosaic(noisy, period=6)
+    assert abs(a / 2 - 1) < 0.15 and abs(b / 40 - 1) < 0.5, (a, b)
+    assert denoise.of_mosaic(noisy)[0] > 4 or denoise.of_mosaic(noisy)[1] > 400, "read 2 apart, its colors pass for noise"
+
+
+def _own(held, scene: np.ndarray, c: int) -> np.ndarray:
+    """A color of a picture in the camera's colors, in the net's terms: v of its own color."""
+    v = scene[..., c] * np.float32(held.gain[c]) + held.offset[c]
+    return np.sqrt(np.maximum(v, 0)) * held.scale[c]
 
 
 def check_denoise_refused() -> None:
@@ -3061,6 +3184,7 @@ def main() -> None:
     check_start()
     check_light()
     check_catalog_before_compensation()
+    check_catalog_before_detail()
     check_saved()
     check_ahead()
     check_session_tools()
@@ -3071,6 +3195,7 @@ def main() -> None:
     check_kept()
     check_denoise()
     check_denoise_refused()
+    check_denoise_kinds()
     check_denoise_exact()
     check_workers()
     check_no_orphan()

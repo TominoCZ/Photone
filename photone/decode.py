@@ -189,6 +189,26 @@ def kept(sizes, half: bool) -> tuple[slice, slice]:
     return slice(top, high - bottom), slice(left, wide - right)
 
 
+def trimmed(rgb: np.ndarray, sizes, half: bool) -> tuple[np.ndarray, tuple[int, int]]:
+    """A developed raw picture cut to the photo (`kept`), and the photo's full size."""
+    high, wide = sizes.height, sizes.width
+    if sizes.flip in (5, 6):  # (a quarter turn)
+        high, wide = wide, high
+    rows, columns = kept(sizes, False)
+    # Asked for half size, LibRaw may give the full one all the same (a Sony's medium and
+    # small lossless raws: no mosaic to halve). Cut by half-size margins, that showed the
+    # top left quarter of the photo, stretched over all of it.
+    for by in (2, 1) if half else (1,):
+        if rgb.shape[:2] == (-(-high // by), -(-wide // by)):
+            return rgb[kept(sizes, by == 2)], (columns.stop - columns.start, rows.stop - rows.start)
+    # Not the shape LibRaw's sizes say (a Fujifilm SuperCCD's, turned back 45° from a square of
+    # 6559 × 6560 to 5430 × 3845): all of the picture as it came, which has no margins. (At
+    # half size the full one is taken to be twice it: a pixel or two off either way, at
+    # most, until the full size comes and says.) It was drawn squeezed into the square.
+    by = 2 if half else 1
+    return rgb, (rgb.shape[1] * by, rgb.shape[0] * by)
+
+
 def develop_raw(path: Path, half: bool) -> tuple[dict, np.ndarray]:
     """Developed no further than demosaicing and the camera's white balance: (h, w, 3) uint16
     (a photo Photone denoised: (h, w, 4) half floats, as it was written).
@@ -219,15 +239,16 @@ def develop_raw(path: Path, half: bool) -> tuple[dict, np.ndarray]:
                 half_size=half, gamma=(1, 1), no_auto_bright=True, output_bps=16,
                 use_camera_wb=True, output_color=rawpy.ColorSpace.Rec2020,
                 highlight_mode=rawpy.HighlightMode.Clip)
+    except rawpy.LibRawFileUnsupportedError as e:  # (its message is a bytes object's repr)
+        raise Unreadable(f"{path.name}: Photone cannot read this kind of raw file yet") from e
     except (rawpy.LibRawError, OSError) as e:
         raise Unreadable(f"{path.name}: {e}") from e
-    rows, columns = kept(sizes, False)
-    full = (columns.stop - columns.start, rows.stop - rows.start)
-    rgb = rgb[kept(sizes, half)]
+    rgb, full = trimmed(rgb, sizes, half)
     info = meta(path.name, rgb.shape[1], rgb.shape[0], full)
     # (With the camera's figures for the lens that was on it, where the file has them:
-    # they travel with what is known of the camera, to wherever the shader's numbers are made.)
-    info.update(raw=True, camera={**about, "lens": lens.figures(path)}, match=match)
+    # they travel with what is known of the camera, to wherever the shader's numbers are made.
+    # None where the file gives no usable matrix: many DNGs, whose LibRaw leaves it zero.)
+    info.update(raw=True, camera=about and {**about, "lens": lens.figures(path)}, match=match)
     return info, rgb
 
 
@@ -343,12 +364,14 @@ class Workers:
             self.pool = self._start()  # the worker died: the next photo gets a new one
             raise Unreadable("the decoder crashed on this file") from None
 
-    def ahead(self, wanted: list[tuple[Path, bool]], begin: bool = True) -> None:
+    def ahead(self, wanted: list[tuple[Path, bool]], begin: bool = True) -> dict:
         """What is worth having before it is asked for (each a photo and whether its quick
         half-size picture or its full one): what is next to the open photo, so that stepping
         there shows it at once (0.3 s otherwise, and 0.7 s until it is sharp). What was
         decoded ahead and is not among them is given up; what is missing is begun, unless
-        `begin` is false (a photo has just been asked for: first that one)."""
+        `begin` is false (a photo has just been asked for: first that one). Gives back what
+        is being or has been decoded ahead, by the same keys (the session looks at what is
+        done: Session.held)."""
         wanted = [(path, half) for path, half in wanted
                   if path.suffix.lower() in RAW or (half and path.suffix.lower() in RASTER)]
         for key in [key for key in self.before if key not in wanted]:
@@ -361,6 +384,7 @@ class Workers:
                     self.calm = self._start(calm=True)
                 except RuntimeError:
                     pass  # shut down
+        return self.before
 
     @staticmethod
     def _give_up(future) -> None:

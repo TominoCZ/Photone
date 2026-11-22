@@ -93,6 +93,7 @@ cd Photone
 ./run.sh                # start in the library
 ./run.sh photo.ARW      # or open a photo directly
 ./run.sh --hdr          # start in HDR, where the desktop has it
+./run.sh --raw-denoise  # let Neural Denoise use the experimental raw net, if one is installed
 ```
 
 The first run downloads Python, Qt and the other packages. System packages are listed in
@@ -128,7 +129,7 @@ Building needs only Python 3.11 or later.
 | Key | Does |
 |---|---|
 | Ctrl+1 / 2 / 3 | Library / Edit / Export |
-| ← → | Previous / next photo (hold to run through them) |
+| ← →, A D | Previous / next photo (hold to run through them) |
 | Wheel, drag | Zoom about the pointer, move the photo |
 | Middle click, double click | Fit; 1:1 and back |
 | B (hold) | Show the photo without its edit |

@@ -1,11 +1,18 @@
-"""Neural denoise: a raw photo through the net Neuro trained, and the result as a DNG.
+"""Neural denoise: a raw photo through a net Neuro trained, and the result as a DNG.
 
-The net (models/nafnet-4m-120k.onnx: a NAFNet of 4 million weights, single precision, run by
-ONNX Runtime) sees the photo after demosaicing, put back into the camera's own colors with
-each made to have noise of one unit at any brightness (v = scale * sqrt(x + offset)), scaled
-so that its median sits at MIDDLE. The noise is then one number all over the picture, which
-is the net's second input. This is Neuro's arithmetic (neuro/tasks/denoise/net.py, test.py,
-raw.py) in numpy: what the net was trained on is what it must be given.
+Two kinds of net, each an ONNX file in models/ (Neuro's export: its PLAN.md §4.40), told apart
+by the file itself (`model`): a raw net, which takes the sensor's own data and demosaics as it
+denoises, and the older net, which takes the photo after LibRaw has demosaiced it. The raw
+net is used where there is one and the photo's sensor is a 2 x 2 mosaic (`sensed`); the older
+one for every other photo (Fujifilm's X-Trans, say), and for all of them while no raw net is
+installed. The window says which ran, and why (`Denoised.why`).
+
+Either sees the photo in the camera's own colors with each made to have noise of one unit at
+any brightness (v = scale * sqrt(x + offset)), scaled so that its median sits at MIDDLE. The
+noise is then one number all over the picture, which is the net's second input. This is
+Neuro's arithmetic (neuro/tasks/denoise/net.py, test.py, raw.py) in numpy: what the net was
+trained on is what it must be given. The raw net's result is in the same terms as the older
+one's, so all that follows (the shares, the preview, the file) is the same for both.
 
 `run` puts a photo through it and keeps the net's result (`Denoised`), so that how much of
 what it took away stays away can be chosen afterwards without running it again: `color` of
@@ -32,15 +39,26 @@ from PySide6.QtGui import QMatrix4x4, QVector4D
 from photone import __version__, decode, dng, edit, lens
 from photone.catalog import identify
 
-MODEL = Path(__file__).parent / "models" / "nafnet-4m-120k.onnx"
-# The net takes pieces of one size, which its file is made for (`_Net.piece`: 512 pixels), and
-# sees 98 pixels around a pixel: each piece is given MARGIN more on every side than is kept of
-# it (a multiple of 8, the net's grid).
-# How large the pieces are is how much of the card the net takes, measured 2026-11-20 on an
-# RTX 3080 Ti, for a 33 MP photo: 1280 px 6.3 GB and 7 s of the net, 768 px 2.4 GB, 640 px
-# 1.9 GB, 512 px 1.2 GB and 11 s. The owner: "i would like it to use less GPU": 512. (With
-# 1280 a card that other programs were using refused pieces, and they went to the processor.)
+MODELS = Path(__file__).parent / "models"
+# A net takes pieces of one size, which its file is made for (`_Net.piece`), and sees some
+# pixels around a pixel: each piece is given a margin more on every side than is kept of it,
+# as its file says (`neuro.margin`; MARGIN for a file that does not say, the first one's: it
+# sees 98). The older net's file (nafnet-4m-v4-120k-768-fp16.onnx: Neuro's run
+# 2026-11-21-0624-4m-nafnet-v4 at step 120,000) is half precision but for its norms' variance,
+# at 768 px pieces (fp16_inference.md, 2026-11-21: 2 times quicker than single precision at
+# 512, and lighter on the card); single precision at 1280 px took 6.3 GB, at 512 1.2 GB.
 MARGIN = 104
+# The older net is told 1.25 times the noise there is (v4_gain_analysis.md, 2026-11-21): the
+# figures are right (they match the noise read off the photo within some 6 %), but told 1.25
+# times, v4 at 120k leaves no sand in out-of-focus places, nor a faint short line it kept: a
+# stronger hand, not a correction. A raw net is told the noise as it is (1) until a trained
+# one is measured.
+STRENGTH = {"developed": 1.25, "sensor": 1.0}
+# Whether a raw net, where one is installed, may run: only when Photone is started with
+# --raw-denoise (the owner, 2026-11-22: "disable the RAW denoiser model ... and only enable it
+# with a launch parameter. this is because the first model works great"). Off, every photo
+# goes through the older net, and Denoise says nothing of the raw one, as with none installed.
+RAW_NET = False
 MIDDLE = 0.25
 # The noise of the cameras measured, by ISO: a per unit of ISO (the light's grain) and b at
 # each ISO (the dark's: the spread of cap-on frames, squared), in the raw file's numbers.
@@ -86,21 +104,23 @@ def _median_of_six(d: np.ndarray) -> np.ndarray:
     return (six[2] + six[3]) * 0.5
 
 
-def _readings(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _readings(values: np.ndarray, period: int = 2) -> tuple[np.ndarray, np.ndarray]:
     """(signal, spread) of every run of eight pixels of one color in a row of a mosaic: their
-    mean, and the noise their differences four apart show."""
-    v = values.astype(np.float32)
-    h, w = v.shape[0] // 2 * 2, v.shape[1] // 16 * 16
+    mean, and the noise their differences two of them apart show. `period`: the side of the
+    mosaic's pattern, so that pixels that far apart are of one color (2 for red, green and
+    blue in 2 x 2 cells; 6 for Fujifilm's X-Trans, whose colors repeat every 6 x 6)."""
+    v, p = values.astype(np.float32), period
+    h, w = v.shape[0] // p * p, v.shape[1] // (8 * p) * (8 * p)
     signals, spreads = [], []
-    for dy, dx in product((0, 1), (0, 1)):
-        runs = v[dy:h:2, dx:w:2].reshape(h // 2, w // 16, 8)  # eight of one color in a row
+    for dy, dx in product(range(p), range(p)):
+        runs = v[dy:h:p, dx:w:p].reshape(h // p, w // (8 * p), 8)  # eight of one color in a row
         signals.append(runs.mean(axis=2).ravel())
         spreads.append(_median_of_six(np.abs(runs[:, :, 2:] - runs[:, :, :-2])).ravel()
                        / 0.6745 / np.sqrt(2))
     return np.concatenate(signals), np.concatenate(spreads)
 
 
-def of_mosaic(values: np.ndarray, share: float = 1 / 3) -> tuple[float, float]:
+def of_mosaic(values: np.ndarray, share: float = 1 / 3, period: int = 2) -> tuple[float, float]:
     """(a, b) of a mosaic with its black level taken off: the noise's variance is
     a * signal + b. From pixels of one color four apart along a row, by how light the place
     is; of every lightness the calmest places count, since texture is not noise.
@@ -109,7 +129,7 @@ def of_mosaic(values: np.ndarray, share: float = 1 / 3) -> tuple[float, float]:
     that keeps their order), where it was a mask of the whole photo for each of 30 bands:
     a band's readings come out the same, in the same order, and are sorted as they were, so
     (a, b) are the same to the last bit. (The masks were 0.6 s of 1.3 for a 33 MP photo.)"""
-    signal, spread = _readings(values)
+    signal, spread = _readings(values, period)
     edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31)))
     # (Band i holds edges[i] <= signal < edges[i + 1], as the masks had it.)
     band = np.searchsorted(edges, signal, side="right") - 1
@@ -148,11 +168,13 @@ def known(shape: tuple, iso: float) -> tuple[float, float] | None:
 
 # --- A raw file, as the net wants it -------------------------------------------------------
 
-def develop(path: Path) -> tuple[np.ndarray, dict]:
+def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:
     """((h, w, 3) uint16 scene-linear Rec.2020, the very picture Photone shows at full size;
     what is known of the photo: the camera's `wb` and `cam_xyz`, the noise's `a` and `b` over
     the range `room`, how it is `turned`, the tone curve it starts with (`match`), its `lens`
-    figures, `header` and `preview`).
+    figures, `header` and `preview`; with `sensor`, what a raw net takes (`sensed`), where it
+    can, and else `why` not: "pattern" (not 2 x 2) or "layout" (a picture LibRaw gives of
+    another size than the sensor's)).
     A ValueError says why a file cannot be denoised."""
     import rawpy
 
@@ -165,13 +187,18 @@ def develop(path: Path) -> tuple[np.ndarray, dict]:
             sizes, camera = raw.sizes, decode.camera(raw.camera_whitebalance, raw.rgb_xyz_matrix)
             if camera is None:
                 raise ValueError(f"{path.name} does not say how its camera sees color.")
-            if raw.raw_pattern is None or raw.raw_pattern.shape != (2, 2):
-                raise ValueError(f"{path.name} is not from a sensor with a mosaic of 2 x 2.")
-            black = float(np.mean(raw.black_level_per_channel))
-            mosaic = raw.raw_image_visible
-            a, b = known(mosaic.shape, float(raw.other.iso_speed)) or of_mosaic(mosaic - black)
+            # (2 x 2 cells, or X-Trans's 6 x 6: a mosaic its noise can be read off; not a
+            # picture the camera already developed, as Canon's mRAW, nor Foveon's layers)
+            pattern = raw.raw_pattern
+            if pattern is None or pattern.shape not in ((2, 2), (6, 6)):
+                raise ValueError(f"{path.name} is not from a sensor with a mosaic of colors.")
+            black, mosaic = float(np.mean(raw.black_level_per_channel)), raw.raw_image_visible
+            a, b = known(mosaic.shape, float(raw.other.iso_speed)) or of_mosaic(
+                mosaic - black, period=pattern.shape[0])
             about = {**camera, "a": a, "b": b, "room": float(raw.white_level - black),
                      "match": decode.match_of(raw, camera), "lens": lens.figures(path)}
+            if sensor:
+                about.update(_sensed(raw) if pattern.shape == (2, 2) else {"why": "pattern"})
             jpeg = _carried(raw)
             rgb = raw.postprocess(half_size=False, gamma=(1, 1), no_auto_bright=True,
                                   output_bps=16, use_camera_wb=True,
@@ -181,7 +208,38 @@ def develop(path: Path) -> tuple[np.ndarray, dict]:
         raise ValueError(f"{path.name} cannot be read as a raw photo ({e}).") from None
     about.update(turned={3: 3, 5: 8, 6: 6}.get(sizes.flip, 1), header=dng.carried(path),
                  preview=jpeg)
+    _fit(about, rgb.shape, sizes)
     return np.ascontiguousarray(rgb[decode.kept(sizes, False)]), about
+
+
+def _fit(about: dict, shape: tuple, sizes) -> None:
+    """The raw net's result is turned and cut as LibRaw's picture is: how (`turn`, `kept`),
+    where the two are of one size; where they are not, no raw net (`why`: "layout")."""
+    if "sensed" not in about:
+        return
+    high, wide = about["sensed"]["mosaic_size"]
+    if shape[:2] != ((wide, high) if sizes.flip in (5, 6) else (high, wide)):
+        del about["sensed"]
+        about["why"] = "layout"
+        return
+    about["sensed"].update(turn={3: 2, 5: 1, 6: 3}.get(sizes.flip, 0),
+                           kept=decode.kept(sizes, False))
+
+
+def _sensed(raw) -> dict:
+    """{"sensed": what a raw net takes of a 2 x 2 mosaic (Neuro's PLAN.md §4.40): `mosaic`,
+    the sensor's values over its range, each color's black off, from its first red (`at`: a
+    row and a column are lost where the order is not RGGB), an even number each way; and the
+    `mosaic_size` of all of it}."""
+    letters = raw.color_desc.decode()
+    at = next((y, x) for y in (0, 1) for x in (0, 1) if letters[raw.raw_pattern[y, x]] == "R")
+    seen, (dy, dx) = raw.raw_image_visible, at
+    h, w = (seen.shape[0] - dy) // 2 * 2, (seen.shape[1] - dx) // 2 * 2
+    black = np.array(raw.black_level_per_channel, np.float32)[
+        raw.raw_colors_visible[dy:dy + h, dx:dx + w]]
+    mosaic = seen[dy:dy + h, dx:dx + w] - black
+    mosaic /= np.float32(raw.white_level - float(np.mean(raw.black_level_per_channel)))
+    return {"sensed": {"mosaic": mosaic, "at": at, "mosaic_size": seen.shape}}
 
 
 def _carried(raw) -> tuple[bytes, tuple[int, int]] | None:
@@ -216,6 +274,9 @@ class Denoised:
         self.noisy, self.about = noisy, about
         self.clean = np.empty(noisy.shape, np.float32)
         self.where = ""  # what the net ran on: "CUDA", "DirectML" or "the processor"
+        # Which net ran: "sensor" (the raw net) or "developed" (the older one); and why not
+        # the raw net: "pattern", "layout" (develop), "missing" (no raw net is installed).
+        self.kind, self.why, self.model = "", about.get("why", ""), None
         wb = np.array(about["wb"], np.float64)
         self.gain = wb / wb.min()  # what the decoder multiplied each of the camera's colors by
         slope = np.maximum(self.gain * about["a"] / max(about["room"], 1), 1e-12)
@@ -239,6 +300,17 @@ class Denoised:
         np.sqrt(cam, out=cam)
         cam *= self.scale
         return cam
+
+    def sensed(self, mosaic: np.ndarray) -> np.ndarray:
+        """(h, w) an RGGB mosaic (the sensor's values over its range, black off) -> v, each
+        pixel in its own color's terms: `into` with the white balance alone."""
+        v = np.empty(mosaic.shape, np.float32)
+        for (dy, dx), c in zip(((0, 0), (0, 1), (1, 0), (1, 1)), (0, 1, 1, 2), strict=True):
+            part = mosaic[dy::2, dx::2] * np.float32(self.gain[c])
+            part += self.offset[c]
+            np.sqrt(np.maximum(part, 0, out=part), out=part)
+            v[dy::2, dx::2] = part * self.scale[c]
+        return v
 
     def camera(self, v: np.ndarray, own: bool = False) -> np.ndarray:
         """v -> the camera's own colors with its white balance on, 1 the sensor's white.
@@ -284,9 +356,38 @@ class Denoised:
 
 # --- The net -------------------------------------------------------------------------------
 
-def session(processor: bool = False):
-    """(the net ready to run, what it runs on). On the GPU where ONNX Runtime has a way to
-    it (CUDA on Linux, DirectML on Windows), else on the processor, which takes minutes."""
+def models(folder: Path | None = None) -> dict:
+    """{"sensor", "developed": the file of each kind of net in `folder` (MODELS), or None}.
+    The first of each, by name."""
+    found = {"sensor": None, "developed": None}
+    for path in sorted((folder or MODELS).glob("*.onnx")):
+        kind = "sensor" if model(path)["raw"] else "developed"
+        found[kind] = found[kind] or path
+    return found
+
+
+def model(path: Path) -> dict:
+    """What a net's file is: {"raw": takes the mosaic (one channel in), "piece": the side of
+    its pieces, "margin": what each is given around it}, read off the file's input and the
+    notes Neuro's export writes into it (a file without them: the first one's MARGIN)."""
+    return _model(str(path), path.stat().st_mtime_ns)
+
+
+@functools.cache
+def _model(path: str, _written: int) -> dict:
+    import onnxruntime as ort
+
+    ort.set_default_logger_severity(3)
+    net = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    seen, notes = net.get_inputs()[0].shape, net.get_modelmeta().custom_metadata_map
+    return {"raw": seen[1] == 1 or notes.get("neuro.kind") == "raw", "piece": int(seen[2]),
+            "margin": int(notes.get("neuro.margin", MARGIN))}
+
+
+def session(processor: bool = False, path: Path | None = None):
+    """(the net of the file at `path` ready to run, what it runs on). On the GPU where ONNX
+    Runtime has a way to it (CUDA on Linux, DirectML on Windows), else on the processor, which
+    takes minutes."""
     import onnxruntime as ort
 
     ort.set_default_logger_severity(3)
@@ -303,7 +404,7 @@ def session(processor: bool = False):
         wanted.append("DmlExecutionProvider")
         options.enable_mem_pattern = False  # (DirectML asks for both)
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    net = ort.InferenceSession(str(MODEL), options, providers=[*wanted, "CPUExecutionProvider"])
+    net = ort.InferenceSession(str(path), options, providers=[*wanted, "CPUExecutionProvider"])
     where = {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}
     return net, where.get(net.get_providers()[0], "the processor")
 
@@ -318,9 +419,10 @@ class _Net:
     (One refusal used to put all the rest of the photo on the processor: two minutes where
     it takes eight seconds, and nothing said why. The owner: "VERY slow for some reason".)"""
 
-    def __init__(self) -> None:
-        self.fast, self.on = session()
-        self.piece = int(self.fast.get_inputs()[0].shape[2])  # the side its file is made for
+    def __init__(self, path: Path) -> None:
+        self.path, self.fast, self.on = path, *session(path=path)
+        made = model(path)
+        self.piece, self.margin = made["piece"], made["margin"]  # what its file is made for
         self.slow, self.refused, self.pieces, self.slowly, self.why = None, 0, 0, 0, ""
 
     def __call__(self, seen: np.ndarray, sigma: np.ndarray) -> np.ndarray:
@@ -337,7 +439,8 @@ class _Net:
                       f"{self.why}", flush=True)
         self.slowly += 1
         try:
-            self.slow = self.slow or (self.fast if self.on == PROCESSOR else session(True)[0])
+            self.slow = self.slow or (
+                self.fast if self.on == PROCESSOR else session(True, self.path)[0])
             return self.slow.run(None, feed)[0]
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"The denoiser failed ({str(e).splitlines()[0][:160]}).") from None
@@ -352,23 +455,50 @@ class _Net:
 
 
 def run(path: Path, progress=None, stopped=None) -> Denoised:
-    """The photo at `path` through the net, a piece at a time. `progress(done, of, where)` is
+    """The photo at `path` through a net, a piece at a time: the raw net where there is one
+    and the photo's sensor allows it, else the older one. `progress(done, of, where)` is
     called after each piece (and once before the first: 0 of them), `where` saying what the
     net runs on; `stopped()` true ends it with `Stopped`. The whole photo is told one noise:
     its norm is of all of it, not of each piece. A ValueError says why it could not be done."""
-    noisy, about = develop(path)
+    found = models()
+    if not RAW_NET:
+        found["sensor"] = None
+    noisy, about = develop(path, sensor=found["sensor"] is not None)
     held = Denoised(noisy, about)
-    high, wide = noisy.shape[:2]
-    net = _Net()
-    kept_ = net.piece - 2 * MARGIN
-    places = list(product(range(0, high, kept_), range(0, wide, kept_)))
+    held.kind, held.why, held.model = chosen(about, found)
+    if held.model is None:
+        raise ValueError("No denoiser is installed: its file is missing from Photone's models.")
+    net = _Net(held.model)
+    v, norm = _sensor_terms(held, about["sensed"]) if held.kind == "sensor" else _terms(held)
+    # (the raw net's result is of the mosaic, from its first red: put in place after, `_upright`)
+    out = np.empty((*v.shape[:2], 3), np.float32) if held.kind == "sensor" else held.clean
+    _pieces(net, v, norm * STRENGTH[held.kind], norm, out, held, progress, stopped)
+    if held.kind == "sensor":
+        _upright(held, about["sensed"], out)
+    return held
+
+
+def chosen(about: dict, found: dict) -> tuple[str, str, Path | None]:
+    """(which net: "sensor" or "developed"; why not the raw one: "" where it is, "pattern",
+    "layout" (develop) or "missing" (none installed); its file) for a photo `develop`ed with
+    a raw net asked for where `found` (`models`) has one."""
+    kind = "sensor" if "sensed" in about else "developed"
+    return kind, "" if kind == "sensor" else about.get("why") or "missing", found[kind]
+
+
+def _pieces(net, v: np.ndarray, told, norm, out: np.ndarray, held: Denoised,  # noqa: PLR0913
+            progress, stopped) -> None:
+    """`v` through the net into `out`, a piece at a time, each with the net's margin; the net
+    told the noise is `told` (`norm`, or more: STRENGTH)."""
+    kept_, m = net.piece - 2 * net.margin, net.margin
+    places = list(product(range(0, v.shape[0], kept_), range(0, v.shape[1], kept_)))
     if progress:
         progress(0, len(places), net.where)
-    v, norm = _terms(held)
-    sigma = np.full((1, 1, 1, 1), norm, np.float32)
+    sigma = np.full((1, 1, 1, 1), told, np.float32)
 
     def cut(at: tuple[int, int]) -> np.ndarray:
-        return np.ascontiguousarray((_piece(v, *at, net.piece) * norm).transpose(2, 0, 1)[None])
+        piece = _piece(v, *at, net.piece, m) * norm
+        return np.ascontiguousarray(piece.transpose(2, 0, 1)[None])
 
     # (Closed here, on this thread, however the loop ends: left to the exception's traceback,
     # its thread would be shut down wherever that is let go, the interface's thread.)
@@ -376,13 +506,34 @@ def run(path: Path, progress=None, stopped=None) -> Denoised:
         for done, ((y, x), seen) in enumerate(zip(places, pieces, strict=True)):
             if stopped and stopped():
                 raise Stopped
-            kept = held.clean[y:y + kept_, x:x + kept_]
-            kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[MARGIN:MARGIN + kept.shape[0],
-                                                               MARGIN:MARGIN + kept.shape[1]] / norm
+            kept = out[y:y + kept_, x:x + kept_]
+            kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[m:m + kept.shape[0],
+                                                               m:m + kept.shape[1]] / norm
             held.where = net.where
             if progress:
                 progress(done + 1, len(places), net.where)
-    return held
+
+
+def _sensor_terms(held: Denoised, sensed: dict) -> tuple:
+    """(the mosaic in the net's terms (h, w, 1), its norm), for a raw net (Neuro's PLAN.md
+    §4.40). One norm for the whole photo, of every fourth 2 x 2 cell each way (still a
+    mosaic). Pieces begin at even rows and columns (the kept part and the margin are even),
+    so each is RGGB from its corner; past the edge the mosaic is mirrored, which keeps the
+    colors' order."""
+    v = held.sensed(sensed["mosaic"])
+    h, w = v.shape
+    cells = v.reshape(h // 2, 2, w // 2, 2)[::4, :, ::4]
+    return v[..., None], np.float32(MIDDLE / max(float(np.median(cells)), 1e-3))
+
+
+def _upright(held: Denoised, sensed: dict, out: np.ndarray) -> None:
+    """The raw net's result (of the mosaic from its first red) put where LibRaw's picture has
+    those pixels: the row and column the RGGB order cost, and an odd last one, are their
+    neighbours'; turned as the file says, and cut to the photo (decode.kept)."""
+    (dy, dx), (high, wide) = sensed["at"], sensed["mosaic_size"]
+    h, w = out.shape[:2]
+    whole = np.pad(out, ((dy, high - dy - h), (dx, wide - dx - w), (0, 0)), "edge")
+    held.clean[...] = np.rot90(whole, sensed["turn"])[sensed["kept"]]
 
 
 def _terms(held: Denoised) -> tuple[np.ndarray, np.float32]:
@@ -415,15 +566,15 @@ def _ahead(cut, places: list):
             yield seen
 
 
-def _piece(seen: np.ndarray, y: int, x: int, piece: int) -> np.ndarray:
+def _piece(seen: np.ndarray, y: int, x: int, piece: int, margin: int = MARGIN) -> np.ndarray:
     """The piece (`piece` a side) of the photo whose kept part begins at (y, x), with its
     margin; past the photo's edge, the photo mirrored in it. (The edge's pixels again made
     lines of the outermost row's noise, a hundred pixels long: to the net those are something
     in the picture, so it left that row half its noise and drew streaks inward from it. The
     owner: "the same artifact around the edges". Mirrored, the noise there is noise.)"""
-    top, left, reach = max(y - MARGIN, 0), max(x - MARGIN, 0), piece - MARGIN
+    top, left, reach = max(y - margin, 0), max(x - margin, 0), piece - margin
     part = seen[top:y + reach, left:x + reach]
-    above, before = top - (y - MARGIN), left - (x - MARGIN)
+    above, before = top - (y - margin), left - (x - margin)
     return np.pad(part, ((above, piece - above - part.shape[0]),
                          (before, piece - before - part.shape[1]), (0, 0)), "reflect")
 
@@ -474,7 +625,8 @@ def save(held: Denoised, path: Path, color: float = 1.0, grain: float = 1.0) -> 
         "software": f"Photone {__version__} (neural denoise)",
         # (`of`: which photo it was made from, as the catalog knows a photo (catalog.identify:
         # the same after a rename or a move), so that the two can be shown as a pair.)
-        "neural": {"model": MODEL.stem, "color": color, "grain": grain, "from": path.name,
+        "neural": {"model": held.model.stem if held.model else "", "color": color,
+                   "grain": grain, "from": path.name,
                    "of": identify(path)},
         "kept": {"matrix": matrix, "match": about["match"],
                  "camera": {"wb": about["wb"], "cam_xyz": about["cam_xyz"],
@@ -524,6 +676,19 @@ class Denoiser(QObject):
         """What the net runs on, or ran on: "CUDA", "DirectML", "the processor", or the first
         with the processor for some pieces."""
         return self._where
+
+    @Property(str, notify=changed)
+    def kind(self) -> str:
+        """Which net made the result: "sensor" (the raw net, from the sensor's own data),
+        "developed" (the older one, after LibRaw's demosaic), or "" while there is none."""
+        return self.held.kind if self.held else ""
+
+    @Property(str, notify=changed)
+    def why(self) -> str:
+        """Why the older net ran: "pattern" (a sensor not of 2 x 2 cells, as X-Trans),
+        "layout" (a file whose picture is not its sensor's size), "missing" (no raw net is
+        installed); "" otherwise."""
+        return self.held.why if self.held else ""
 
     @Property(str, notify=changed)
     def target(self) -> str:

@@ -27,6 +27,13 @@ Item {
     readonly property bool there: denoiser.state !== "" && denoiser.state !== "working" && denoiser.state !== "failed"
                                   && cleanPicture.status === Image.Ready && cleanPicture.sourceSize.width > 1 && stage.ready && stage.sharpThere
     readonly property bool busy: denoiser.state === "working" || denoiser.state === "saving" || (denoiser.state === "ready" && !there)
+    // Which net made the result (photone/denoise.py, `chosen`), a quiet line under the photo's
+    // name (the owner's pick of three rendered, 2026-11-21): the raw net's, and why the older
+    // one ran where the photo's sensor is the reason. While no raw net is installed, nothing.
+    readonly property string reason: ({ pattern: "this camera's sensor pattern isn't supported by the new one yet.",
+                                        layout: "this file's sensor layout isn't supported by the new one yet." })[denoiser.why] || ""
+    readonly property string which: denoiser.kind === "sensor" ? "Denoised from the sensor's data"
+                                    : denoiser.kind === "developed" && reason !== "" ? "Older denoiser: " + reason : ""
 
     function open() {
         // Where the photo was being looked at, at 100 %: noise is judged from close.
@@ -225,6 +232,12 @@ Item {
                 width: parent.width; spacing: 6
                 Label { text: "Neural Denoise"; color: Theme.text; font.pixelSize: 17; font.weight: Font.DemiBold }
                 Label { width: parent.width; elide: Text.ElideMiddle; text: session.name }
+                Label {
+                    objectName: "denoise-which"
+                    visible: window.which !== ""
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 12; color: Theme.faint
+                    text: window.which
+                }
                 Item { width: 1; height: 10 }
                 ParamSlider {
                     objectName: "denoise-color"

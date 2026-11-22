@@ -75,8 +75,9 @@ Rectangle {
         if (root.place !== "edit") return
         // The arrows, held, go on through the photos (the owner: "hold left/right arrows to
         // quickly list through the filmstrip"); every other key acts once however long held.
-        if (!ctrl && event.key === Qt.Key_Left) return session.step(-1)
-        if (!ctrl && event.key === Qt.Key_Right) return session.step(1)
+        // (A and D too, the owner's ask: the left hand's keys for the same.)
+        if (!ctrl && (event.key === Qt.Key_Left || event.key === Qt.Key_A)) return session.step(-1)
+        if (!ctrl && (event.key === Qt.Key_Right || event.key === Qt.Key_D)) return session.step(1)
         if (event.isAutoRepeat) return
         // Marking the photo on show, as in the library: Edit is where a photo is looked at closely.
         if (!ctrl && event.key === Qt.Key_P) return library.markPhoto(session.path, "flag", 1)

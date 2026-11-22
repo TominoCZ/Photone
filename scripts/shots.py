@@ -31,7 +31,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import Q_ARG, QCoreApplication, QElapsedTimer, QEvent, QEventLoop, QMetaObject, QObject, QPoint, QPointF, QRectF, QSettings, Qt, qInstallMessageHandler  # noqa: E402
+from PySide6.QtCore import Q_ARG, QCoreApplication, QElapsedTimer, QEvent, QEventLoop, QMetaObject, QObject, QPoint, QPointF, QRectF, QSettings, Qt, QUrl, qInstallMessageHandler  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QKeyEvent, QMouseEvent, QPainter, QSurfaceFormat, QWheelEvent  # noqa: E402
 from PySide6.QtQuick import QSGRendererInterface  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
@@ -242,6 +242,35 @@ def neural(root, session, state: str, share: float = 1.0) -> None:
     denoiser._set(state, "IMG_0001.ARW cannot be read as a raw photo (data error)." if state == "failed" else "", share)
     find(root, "denoise-window").setProperty("visible", True)
     find(root, "denoise-cancel").forceActiveFocus()  # (as its `open` does: the keys are its own)
+
+
+# A real raw photo for the Neural Denoise shots of which net ran (PHOTONE_SAMPLE, else the
+# owner's sample where it is; the test chart where there is none: a test chart is not the app).
+SAMPLE = Path(os.environ.get("PHOTONE_SAMPLE", "/data/projects/Neuro/samples/IMG01184.ARW"))
+
+
+def told(kind: str, why: str = ""):
+    """A shot of the Neural Denoise window, ready, on SAMPLE, saying which net ran (Denoise.qml's
+    `which`): `kind` "sensor" or "developed", and `why`."""
+    def make() -> ui.Session:
+        return ui.Session([SAMPLE]) if SAMPLE.is_file() else photo()
+
+    def after(root, session) -> None:
+        from photone import denoise
+
+        denoiser = session.denoiser
+        denoiser._path = session.photos[0]
+        meta, pixels = decode.load(SAMPLE, half=False) if SAMPLE.is_file() else chart(session.photos[0], False)
+        seen = np.frombuffer(pixels.buf, np.float16).reshape(meta["height"], meta["width"], 4)
+        noisy = np.clip(seen[..., :3].astype(np.float32) * 65535, 0, 65535).astype(np.uint16)
+        held = denoise.Denoised(noisy, {**meta["camera"], "a": 1.0, "b": 10.0, "room": 15000.0})
+        held.clean[...], held.where, held.kind, held.why = held.into(noisy), "CUDA", kind, why
+        denoiser.held, denoiser.pixels = held, held.picture()
+        denoiser._run += 1
+        denoiser._set("ready", "", 1.0)
+        find(root, "denoise-window").setProperty("visible", True)
+        find(root, "denoise-cancel").forceActiveFocus()
+    return make, after
 
 
 def call(item, function: str, *args):
@@ -579,6 +608,11 @@ SHOTS = {
     "denoise-ready": (BIG, photo, lambda root, session: neural(root, session, "ready")),
     "denoise-small": (SMALL, photo, lambda root, session: neural(root, session, "ready")),
     "denoise-failed": (BIG, photo, lambda root, session: neural(root, session, "failed")),
+    # Which net ran, on a real photo: the raw net; the older one for a sensor the raw net does
+    # not take (X-Trans); and the older one because no raw net is installed (nothing said)
+    "denoise-sensor": (BIG, *told("sensor")),
+    "denoise-older": (BIG, *told("developed", "pattern")),
+    "denoise-missing": (BIG, *told("developed", "missing")),
     "lens": (BIG, lambda: ui.Session([Path("test chart.arw")], load=lensed), lambda root, session: (
         session.setEdit("lensColor", False), show(root, "lens"))),
     "lens-none": (SMALL, photo, lambda root, session: show(root, "lens")),
@@ -1014,6 +1048,18 @@ def audit_gestures(view, root, session) -> list[str]:
     key(QEvent.Type.KeyRelease, Qt.Key.Key_B)
     if session.original:
         faults.append("letting go of B does not bring the edit back")
+    # While the next photo is on its way it has no size: a drag or a notch then must leave the
+    # view as it is (they put it at 100 % in a corner, and the photo came there).
+    call(pane, "fit")
+    pane.setProperty("missing", True)   # (what `ready` reads; `have` follows the pictures)
+    settle()
+    drag(Qt.MouseButton.LeftButton)
+    turn(120)
+    if not pane.property("fitted") or pane.property("center") != QPointF(0.5, 0.5):
+        faults.append(f"a drag and a notch while no photo is shown moved the view: "
+                      f"fitted {pane.property('fitted')}, center {pane.property('center')}")
+    pane.setProperty("missing", False)
+    settle()
     for key_, name in zip(("fitted", "zoom", "center"), was):
         pane.setProperty(key_, name)
     settle()
@@ -2132,7 +2178,7 @@ def audit_test_chart() -> list[str]:
     click(view, find(root, "show-chart"))
     QCoreApplication.sendEvent(root, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier))
     settle()
-    faults.expect(not session.panels["chart"] and "1/1/" in session.source, "the next photo opens with the test chart still on")
+    faults.expect(not session.panels["chart"] and session.index == 1 and "chart" not in session.source, "the next photo opens with the test chart still on")
     ui.close_view(view)
     # The photo's lens corrections are not for the chart, which no lens drew: neither the
     # camera's figures nor Defringe.
@@ -2760,6 +2806,53 @@ def audit_stepping() -> list[str]:
     if session.source.rsplit("/", 2)[1] != "1" or pane.property("fitted") or (pane.property("zoom"), pane.property("center")) != held:
         faults.append(f"stepping to another photo changed the zoom or the place: {held} to {pane.property('zoom')}, {pane.property('center')}, "
                       f"fitted {pane.property('fitted')}")
+    ui.close_view(view)
+    return faults
+
+
+def audit_held() -> list[str]:
+    """A step to a photo beside the open one, whose first picture is held (`session.held`),
+    shows that photo in the first frame drawn after it: not its thumbnail, not nothing. Read
+    off a frame the GPU draws, not off `ready` (PLAN.md §4.1 once timed that: "28 ms", where
+    the screen showed the thumbnail for 40 to 130 ms)."""
+    from concurrent.futures import Future
+
+    def one_color(path: Path, half: bool):
+        rgb = np.full((64, 96, 3), 0.05, np.float32)
+        rgb[..., int(path.stem) % 3] = 0.7
+        return decode.meta(path.name, 96, 64), decode.Pixels(decode.pack(rgb))
+
+    session = ui.Session([Path(f"{n}.png") for n in range(5)], load=one_color)
+    done = Future()
+    done.set_result(None)
+    session.ahead = lambda wanted, begin=True: dict.fromkeys(wanted, done)  # all decoded ahead at once
+    view, root = opened(session, "")
+    middle = box(stage(root)).center().toPoint()
+    faults = Faults()
+
+    def drawn() -> int:  # which photo the frame drawn now shows in the middle (its color), or -1
+        rgb = export.bytes_of(view.grabWindow().copy(middle.x() - 2, middle.y() - 2, 4, 4))[..., :3].mean(axis=(0, 1))
+        return int(rgb.argmax()) if rgb.max() > 2 * np.median(rgb) + 20 else -1
+
+    def held() -> bool:
+        there = {i.property("source").toString() for i in stage(root).childItems() if isinstance(i.property("source"), QUrl) and i.property("implicitWidth") > 0}
+        return len(session.held) > 0 and set(session.held) <= there
+
+    session.goTo(1)
+    for way in (1, -1, -1):  # on, back to the one before (held as the one behind), and on again
+        faults.expect(wait(held), f"the photos beside photo {session.index} are never held")
+        settle()
+        session.step(way)
+        faults.expect(drawn() == session.index % 3, f"a step to photo {session.index}, beside the one before, does not show it in the next frame")
+    # (Proof that the audit can tell: a photo that is not held is not on the next frame.)
+    wait(held)
+    session.goTo(4)
+    faults.expect(drawn() == -1, "a photo two along, not held, was drawn at once: the audit proves nothing")
+    # Other photos opened (another folder): what was held of these is let go, and its GPU memory.
+    session.openAt([f"{n}.png" for n in (5, 6)], 0)
+    settle()
+    kept = {a for i in stage(root).childItems() if isinstance(i.property("source"), QUrl) and (a := i.property("source").toString()).endswith("/half")}
+    faults.expect(kept <= {session.source, *session.held}, f"other photos opened, pictures of the ones before are still held: {kept}")
     ui.close_view(view)
     return faults
 
@@ -4392,12 +4485,12 @@ def audit_detail() -> list[str]:
         return float(((across > low + 0.1 * (high - low)) & (across < low + 0.9 * (high - low))).sum())
 
     def set_(**values) -> None:
-        # (From nothing of it: a photo starts with a little of each, the owner's choice.)
+        # (From nothing of it, as a photo starts.)
         session.setEdits({"sharpen": 0.0, "sharpenRadius": 1.0, "sharpenMask": 0.0, "denoise": 0.0, "denoiseColor": 0.0, **values})
         settle()
 
-    faults.expect(session.uniforms["sharpen"] == 0.2 and session.uniforms["denoise"] > 0 and session.uniforms["denoiseColor"] > 0 and session.history.edit == {},
-                  "a photo does not start with a little sharpening and noise reduction")
+    faults.expect(session.uniforms["sharpen"] == 0 and session.uniforms["denoise"] == 0 and session.uniforms["denoiseColor"] == 0 and session.history.edit == {},
+                  "a photo starts with sharpening or noise reduction")
     set_()
     gray = part(20, 140)
     light, tint, edge = gray.mean(axis=2).std(), (gray[..., 0] - gray[..., 1]).std(), rise()
@@ -4457,7 +4550,11 @@ def audit_detail() -> list[str]:
     small = lambda: export.bytes_of(view.grabWindow().copy(int(area.left()) + 8, int(area.top()) + 16, 48, 96)).astype(float)  # noqa: E731
     set_()
     far = small().mean(axis=2).std()
+    # (At 0 the full-size picture they are kept in is not made: no memory for nothing.)
+    kept_ = lambda: root.findChild(QObject, "detailed").property("on")  # noqa: E731
+    faults.expect(not kept_(), "all of Detail at 0, and its full-size picture is made all the same")
     set_(denoise=100.0)
+    faults.expect(kept_(), "Detail turned up from 0 while seen from far, and no full-size picture of it is made")
     faults.expect(small().mean(axis=2).std() < 0.8 * far, f"seen at 40 %, noise reduction at 100 leaves {small().mean(axis=2).std():.2f} levels of noise of {far:.2f}")
     ui.close_view(view)
     return faults
@@ -4515,7 +4612,9 @@ def audit_lens() -> list[str]:
                   and not any(find(root, f"lens:{name}").property("on") for name in ("distortion", "color", "vignetting")),
                   f"a file with figures: {session.lensHas}; its corrections are not off from the start")
     off = {"lensDistortion": False, "lensColor": False, "lensVignetting": False}
-    session.setEdits(off)
+    # (With the sharpening a photo started with until 2026-11-22, when `steps` was set:
+    # without it, blue's last step is too soft to be found.)
+    session.setEdits({**off, **catalog.DETAIL_ON})
     session.commitEdit()
     plain_ = seen()
     faults.expect(session.uniforms["lensOn"] == 0, "switched off, something is still done")
@@ -4526,7 +4625,7 @@ def audit_lens() -> list[str]:
     click(view, find(root, "lens:vignetting"))
     lit = seen()
     high, wide = lit.shape[:2]
-    faults.expect(session.history.edit == {"lensVignetting": True} and np.abs(lit[high // 2 - 4:high // 2 + 4, wide // 2 - 4:wide // 2 + 4] - plain_[high // 2 - 4:high // 2 + 4, wide // 2 - 4:wide // 2 + 4]).max() <= 1,
+    faults.expect(session.history.edit == {"lensVignetting": True, **catalog.DETAIL_ON} and np.abs(lit[high // 2 - 4:high // 2 + 4, wide // 2 - 4:wide // 2 + 4] - plain_[high // 2 - 4:high // 2 + 4, wide // 2 - 4:wide // 2 + 4]).max() <= 1,
                   f"Vignetting: {session.history.edit}, or the picture's middle changed")
     corner = lambda shot: shot[int(0.7 * high):int(0.76 * high), int(0.03 * wide):int(0.06 * wide)].mean()  # noqa: E731
     faults.expect(corner(lit) > corner(plain_) * 1.1, f"Vignetting: a corner went from {corner(plain_):.1f} to {corner(lit):.1f} levels")
@@ -4562,10 +4661,10 @@ def audit_lens() -> list[str]:
     # Reset all switches them off again; the file is the picture on screen, with all three.
     session.resetAll()
     faults.expect(session.history.edit == {} and session.uniforms["lensOn"] == 0, "Reset all does not switch the three corrections off")
-    session.setEdits(dict(catalog.LENS_ON))
+    session.setEdits({**catalog.LENS_ON, **catalog.DETAIL_ON})
     session.commitEdit()
-    # Seen from close, the photo's pixels are squares also with the corrections (and the
-    # sharpening and noise reduction a photo starts with) on: along a row, four pixels of
+    # Seen from close, the photo's pixels are squares also with the corrections (and some
+    # sharpening and noise reduction) on: along a row, four pixels of
     # the screen to one of the photo, the color changes every fourth pixel and not between.
     centre = box(stage(root)).center()
     call(stage(root), "zoomTo", 4.0, centre.x(), centre.y())
@@ -5338,7 +5437,7 @@ def audit_brush() -> list[str]:
     return said or ([] if done.returncode == 0 else [f"the brush check ended badly: {done.stderr.strip()[-300:]}"])
 
 
-AUDITS = {"(keys)": audit_stepping, "(dock)": audit_dock, "(column)": audit_column, "(wheel)": audit_wheel,
+AUDITS = {"(keys)": audit_stepping, "(held)": audit_held, "(dock)": audit_dock, "(column)": audit_column, "(wheel)": audit_wheel,
           "(wheel data)": audit_wheel_data, "(dots)": audit_dots_place, "(pixels)": audit_pixels, "(colors data)": audit_colors_data, "(pins)": audit_pins,
           "(pin panel)": audit_pin_panel,
           "(masks)": audit_masks, "(brush)": audit_brush, "(mask wheel)": audit_mask_wheel, "(masks data)": audit_masks_data, "(moves)": audit_moves, "(scroll)": audit_scroll, "(resume)": audit_resume, "(strip)": audit_strip, "(strip wheel)": audit_strip_wheel, "(local)": audit_local, "(fourth)": audit_fourth, "(mono)": audit_mono, "(detail)": audit_detail, "(lens)": audit_lens, "(fringes)": audit_fringes, "(mark)": audit_mark, "(grain)": audit_grain, "(look)": audit_look, "(presets)": audit_presets, "(lut)": audit_lut, "(table)": audit_table, "(menu)": audit_menu, "(color tools)": audit_color_tools,

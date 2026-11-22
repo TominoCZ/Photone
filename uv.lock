@@ -242,7 +242,7 @@ requires-dist = [
     { name = "onnxruntime-directml", marker = "sys_platform == 'win32'", specifier = ">=1.22" },
     { name = "onnxruntime-gpu", extras = ["cuda", "cudnn"], marker = "sys_platform == 'linux'", specifier = ">=1.22" },
     { name = "pyside6", specifier = ">=6.8" },
-    { name = "rawpy", specifier = ">=0.24" },
+    { name = "rawpy", specifier = "==0.28.0" },
 ]
 
 [[package]]
