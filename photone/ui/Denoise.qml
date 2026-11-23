@@ -6,8 +6,10 @@ import "."
 // clicked or typed into while it is up). The open photo goes through the net when it opens
 // (photone/denoise.py, `denoiser`); a ring over the picture says how far that is. Then the
 // picture is the net's result with the photo's edit on it, to be looked at as the photo is in
-// Edit: the wheel zooms, a drag moves it. Color noise and Grain say how much of what the net
-// took stays away; they are mixed here, on the GPU (mixing.frag), so they follow the hand.
+// Edit: the wheel zooms, a drag moves it. Grain removal says how much of the grain the net took stays
+// away; it is mixed here, on the GPU (mixing.frag), so it follows the hand. The color noise
+// always stays away in full (the owner, 2026-11-23: it is always well removed, and the worse
+// of the two to look at).
 // Denoise writes the file (the same shares, mixed by denoise.py in full floats) and `done`
 // names it; Cancel, Escape and a failure leave everything as it was.
 Item {
@@ -15,9 +17,9 @@ Item {
     anchors.fill: parent
     visible: false
     property var stage             // the Edit screen's photo (PhotoView): its pictures are used here
-    // Percent of the color noise the net found that stays away, and of the grain: as they were
-    // left the last time, in this run or an earlier one.
-    property real colorShare: kept("denoise/color")
+    // Percent of the color noise the net found that stays away (all of it), and of the grain:
+    // as it was left the last time, in this run or an earlier one.
+    readonly property real colorShare: 100
     property real grainShare: kept("denoise/grain")
     function kept(key) { const v = parseFloat(session.remembered(key, "100")); return isFinite(v) ? Math.max(0, Math.min(100, v)) : 100 }
     signal done(string path)       // the denoised file is written
@@ -240,17 +242,8 @@ Item {
                 }
                 Item { width: 1; height: 10 }
                 ParamSlider {
-                    objectName: "denoise-color"
-                    width: parent.width; name: "Color noise"; unit: "%"; from: 0; to: 100; neutral: 100; step: 1; digits: 0; signed: false
-                    enabled: window.there && denoiser.state === "ready"; opacity: enabled ? 1 : 0.4
-                    value: window.colorShare
-                    onMoved: (v) => window.colorShare = v
-                    onReleased: session.remember("denoise/color", String(window.colorShare))
-                    onReset: { window.colorShare = 100; session.remember("denoise/color", "100") }
-                }
-                ParamSlider {
                     objectName: "denoise-grain"
-                    width: parent.width; name: "Grain"; unit: "%"; from: 0; to: 100; neutral: 100; step: 1; digits: 0; signed: false
+                    width: parent.width; name: "Grain removal"; unit: "%"; from: 0; to: 100; neutral: 100; step: 1; digits: 0; signed: false
                     enabled: window.there && denoiser.state === "ready"; opacity: enabled ? 1 : 0.4
                     value: window.grainShare
                     onMoved: (v) => window.grainShare = v
@@ -259,7 +252,7 @@ Item {
                 }
                 Label {
                     width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 12; color: Theme.faint; topPadding: 4
-                    text: "How much of what the net found stays away: the colored speckle, and the lighter and darker grain. At 100 the photo is as the net left it; lower gives some of it back."
+                    text: "At 100 the photo is as the net left it; lower gives some of the grain back. Color noise is always removed."
                 }
             }
             Column {
