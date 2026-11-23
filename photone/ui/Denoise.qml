@@ -180,12 +180,12 @@ Item {
                 }
                 Column {
                     anchors.centerIn: parent; spacing: 0
-                    Label { anchors.horizontalCenter: parent.horizontalCenter; color: Theme.text; font.pixelSize: 20; text: denoiser.state === "working" ? Math.round(denoiser.progress * 100) + " %" : "…" }
-                    Label { anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: Theme.smallSize; text: denoiser.state === "saving" ? "Writing" : denoiser.state === "working" ? "Denoising" : "Preview" }
+                    Label { anchors.horizontalCenter: parent.horizontalCenter; color: Theme.text; font.pixelSize: 20; text: denoiser.state === "working" && denoiser.progress > 0 ? Math.round(denoiser.progress * 100) + " %" : "…" }
+                    Label { anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: Theme.smallSize; text: denoiser.state === "saving" ? "Writing" : denoiser.state === "working" ? denoiser.step : "Preview" }
                     // (Said while it runs: on the processor it takes minutes, and that must not be a riddle.)
                     Label { objectName: "denoise-where"; anchors.horizontalCenter: parent.horizontalCenter; visible: denoiser.state === "working" && denoiser.where.includes("processor"); font.pixelSize: Theme.smallSize; color: Theme.mark; text: "on the processor" }
                 }
-                Accessible.role: Accessible.ProgressBar; Accessible.name: "Denoising"
+                Accessible.role: Accessible.ProgressBar; Accessible.name: denoiser.state === "working" ? denoiser.step : "Denoising"
             }
             Rectangle {
                 visible: denoiser.state === "failed"

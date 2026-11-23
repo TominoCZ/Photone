@@ -43,12 +43,14 @@ MODELS = Path(__file__).parent / "models"
 # A net takes pieces of one size, which its file is made for (`_Net.piece`), and sees some
 # pixels around a pixel: each piece is given a margin more on every side than is kept of it,
 # as its file says (`neuro.margin`; MARGIN for a file that does not say, the first one's: it
-# sees 98). The older net's file (nafnet-4m-v4-120k-768-fp16.onnx: Neuro's run
-# 2026-11-21-0624-4m-nafnet-v4 at step 120,000) is half precision but for its norms' variance,
-# at 768 px pieces (fp16_inference.md, 2026-11-21: 2 times quicker than single precision at
-# 512, and lighter on the card); single precision at 1280 px took 6.3 GB, at 512 1.2 GB.
+# sees 98). The older net's file (hybrid-4m-200k-768-fp16.onnx: Neuro's hybrid NAFNet, 4M, at
+# step 200,000, the owner's pick of 2026-11-23; before it nafnet-4m-v4-120k) is half precision
+# but for its norms' variance, at 768 px pieces (fp16_inference.md, 2026-11-21: 2 times
+# quicker than single precision at 512, and lighter on the card); single precision at 1280 px
+# took 6.3 GB, at 512 1.2 GB.
 MARGIN = 104
-# The older net is told 1.25 times the noise there is (v4_gain_analysis.md, 2026-11-21): the
+# The older net is told 1.25 times the noise there is (v4_gain_analysis.md, 2026-11-21, measured
+# on v4 and kept for the hybrid until it is measured again): the
 # figures are right (they match the noise read off the photo within some 6 %), but told 1.25
 # times, v4 at 120k leaves no sand in out-of-focus places, nor a faint short line it kept: a
 # stronger hand, not a correction. A raw net is told the noise as it is (1) until a trained
@@ -454,12 +456,16 @@ class _Net:
             f"{self.on}, and {PROCESSOR} for {self.slowly} of {self.pieces} pieces")
 
 
-def run(path: Path, progress=None, stopped=None) -> Denoised:
+def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     """The photo at `path` through a net, a piece at a time: the raw net where there is one
     and the photo's sensor allows it, else the older one. `progress(done, of, where)` is
     called after each piece (and once before the first: 0 of them), `where` saying what the
-    net runs on; `stopped()` true ends it with `Stopped`. The whole photo is told one noise:
+    net runs on; `stopped()` true ends it with `Stopped`; `step(words)` says what it is doing
+    before the pieces count (a cold start spends seconds there: the photo read, the net
+    loaded, its first piece while the GPU warms up). The whole photo is told one noise:
     its norm is of all of it, not of each piece. A ValueError says why it could not be done."""
+    step = step or (lambda _: None)
+    step("Reading photo")
     found = models()
     if not RAW_NET:
         found["sensor"] = None
@@ -468,7 +474,9 @@ def run(path: Path, progress=None, stopped=None) -> Denoised:
     held.kind, held.why, held.model = chosen(about, found)
     if held.model is None:
         raise ValueError("No denoiser is installed: its file is missing from Photone's models.")
+    step("Loading model")
     net = _Net(held.model)
+    step("Warming up")
     v, norm = _sensor_terms(held, about["sensed"]) if held.kind == "sensor" else _terms(held)
     # (the raw net's result is of the mosaic, from its first red: put in place after, `_upright`)
     out = np.empty((*v.shape[:2], 3), np.float32) if held.kind == "sensor" else held.clean
@@ -645,6 +653,7 @@ class Denoiser(QObject):
     changed = Signal()
     saved = Signal(str)                # the new file, written: its path
     stepped = Signal(int, float, str)  # from the thread: (which run, how far 0..1, on what)
+    phased = Signal(int, str)          # from the thread: (which run, what it is doing: `run`)
     finished = Signal(int, object)     # from the thread: (which run, what came of it)
 
     def __init__(self, session) -> None:
@@ -653,8 +662,9 @@ class Denoiser(QObject):
         self.held: Denoised | None = None
         self.pixels: np.ndarray | None = None  # the net's result as the preview's picture
         self._run, self._state, self._progress, self._message, self._path = 0, "", 0.0, "", None
-        self._where = ""
+        self._where, self._step = "", ""
         self.stepped.connect(self._stepped)
+        self.phased.connect(self._phased)
         self.finished.connect(self._finished)
 
     @Property(str, notify=changed)
@@ -670,6 +680,12 @@ class Denoiser(QObject):
     @Property(str, notify=changed)
     def message(self) -> str:
         return self._message
+
+    @Property(str, notify=changed)
+    def step(self) -> str:
+        """While "working": what it is doing ("Reading photo", "Loading model", "Warming up",
+        then "Denoising" once the first piece is done)."""
+        return self._step
 
     @Property(str, notify=changed)
     def where(self) -> str:
@@ -729,6 +745,7 @@ class Denoiser(QObject):
         """That photo through the net. Whatever was under way or kept is let go."""
         self._run += 1
         self.held, self.pixels, self._path, self._where = None, None, Path(path), ""
+        self._step = "Reading photo"
         self._set("working")
         threading.Thread(target=self._work, args=(self._run, self._path), daemon=True,
                          name="denoise").start()
@@ -736,7 +753,7 @@ class Denoiser(QObject):
     def _work(self, mine: int, path: Path) -> None:
         try:
             held = run(path, lambda done, of, on: self.stepped.emit(mine, done / max(of, 1), on),
-                       lambda: mine != self._run)
+                       lambda: mine != self._run, lambda words: self.phased.emit(mine, words))
             self.finished.emit(mine, (held, held.picture()))
         except Stopped:
             pass
@@ -746,6 +763,12 @@ class Denoiser(QObject):
     def _stepped(self, mine: int, share: float, on: str) -> None:
         if mine == self._run and self._state == "working":
             self._progress, self._where = share, on
+            self._step = "Denoising" if share > 0 else self._step
+            self.changed.emit()
+
+    def _phased(self, mine: int, words: str) -> None:
+        if mine == self._run and self._state == "working":
+            self._step = words
             self.changed.emit()
 
     def _finished(self, mine: int, result) -> None:

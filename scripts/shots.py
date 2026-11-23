@@ -223,7 +223,7 @@ def stage(root):
     return root.findChild(QObject, "box:stage")
 
 
-def neural(root, session, state: str, share: float = 1.0) -> None:
+def neural(root, session, state: str, share: float = 1.0, step: str = "Denoising") -> None:
     """The Neural Denoise window in one of its states, without the net (which wants a real raw
     file and seconds of a GPU): "working" at `share` of the way, "ready" with the chart itself
     as the net's result, or "failed"."""
@@ -239,6 +239,7 @@ def neural(root, session, state: str, share: float = 1.0) -> None:
         held.clean[...], held.where = held.into(noisy), "CUDA"
         denoiser.held, denoiser.pixels = held, held.picture()
     denoiser._run += 1  # (another address for its picture)
+    denoiser._step = step
     denoiser._set(state, "IMG_0001.ARW cannot be read as a raw photo (data error)." if state == "failed" else "", share)
     find(root, "denoise-window").setProperty("visible", True)
     find(root, "denoise-cancel").forceActiveFocus()  # (as its `open` does: the keys are its own)
@@ -605,6 +606,7 @@ SHOTS = {
     "detail-denoised": (BIG, photo, lambda root, session: (
         setattr(session, "_denoised", True), session.refresh(), show(root, "detail"))),
     "denoise-working": (BIG, photo, lambda root, session: neural(root, session, "working", 0.42)),
+    "denoise-warming": (BIG, photo, lambda root, session: neural(root, session, "working", 0.0, "Warming up")),
     "denoise-ready": (BIG, photo, lambda root, session: neural(root, session, "ready")),
     "denoise-small": (SMALL, photo, lambda root, session: neural(root, session, "ready")),
     "denoise-failed": (BIG, photo, lambda root, session: neural(root, session, "failed")),
