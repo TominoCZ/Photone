@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import mmap
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
@@ -268,13 +269,25 @@ def _jpeg_size(jpeg: bytes) -> tuple[int, int] | None:
     return None
 
 
+def _small_pages(shape: tuple) -> np.ndarray:
+    """np.empty(shape, np.float32), in the system's ordinary small pages. numpy asks Linux for
+    huge ones for any big array, and where memory is in bits (another program at work) each
+    first write to one waits while the kernel makes room: the net's results written into a
+    photo's worth of them took 2 to 4 s more of a run, in the kernel (measured, 2026-11-23:
+    the system time and the extra were one; 0.1 s with nothing else running)."""
+    pages = mmap.mmap(-1, int(np.prod(shape)) * 4)
+    if hasattr(mmap, "MADV_NOHUGEPAGE"):  # (Linux's; Windows gives small pages anyway)
+        pages.madvise(mmap.MADV_NOHUGEPAGE)
+    return np.frombuffer(pages, np.float32).reshape(shape)
+
+
 class Denoised:
     """A photo and what the net made of it. `noisy`: the picture as developed; `clean`: the
     net's result in its own terms (v, before the scaling to MIDDLE), every pixel of it."""
 
     def __init__(self, noisy: np.ndarray, about: dict) -> None:
         self.noisy, self.about = noisy, about
-        self.clean = np.empty(noisy.shape, np.float32)
+        self.clean = _small_pages(noisy.shape)
         self.where = ""  # what the net ran on: "CUDA", "DirectML" or "the processor"
         # Which net ran: "sensor" (the raw net) or "developed" (the older one); and why not
         # the raw net: "pattern", "layout" (develop), "missing" (no raw net is installed).
@@ -469,13 +482,19 @@ def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     found = models()
     if not RAW_NET:
         found["sensor"] = None
-    noisy, about = develop(path, sensor=found["sensor"] is not None)
+    # (Where the older net is the one there is, the photo is read on a thread while the net
+    # is loaded and warmed up on this one, the thread that runs it: ONNX Runtime readies the
+    # GPU for each thread that uses it, so warmed on another it is readied again here.)
+    with ThreadPoolExecutor(1) as early:
+        reading = early.submit(develop, path, sensor=found["sensor"] is not None)
+        warm = _warmed(found["developed"]) if found["developed"] and not found["sensor"] else None
+        noisy, about = reading.result()
     held = Denoised(noisy, about)
     held.kind, held.why, held.model = chosen(about, found)
     if held.model is None:
         raise ValueError("No denoiser is installed: its file is missing from Photone's models.")
     step("Loading model")
-    net = _Net(held.model)
+    net = warm or _Net(held.model)
     step("Warming up")
     v, norm = _sensor_terms(held, about["sensed"]) if held.kind == "sensor" else _terms(held)
     # (the raw net's result is of the mosaic, from its first red: put in place after, `_upright`)
@@ -484,6 +503,18 @@ def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     if held.kind == "sensor":
         _upright(held, about["sensed"], out)
     return held
+
+
+def _warmed(path: Path) -> _Net:
+    """The net, with a piece of nothing put through it on the GPU: its first piece there
+    spends half a second readying the GPU's libraries. (Refused, it is left to the first
+    real piece, which knows what to do then.)"""
+    net = _Net(path)
+    if net.on != PROCESSOR:
+        with contextlib.suppress(Exception):
+            net.fast.run(None, {"x": np.zeros((1, 3, net.piece, net.piece), np.float32),
+                                "sigma": np.zeros((1, 1, 1, 1), np.float32)})
+    return net
 
 
 def chosen(about: dict, found: dict) -> tuple[str, str, Path | None]:
@@ -548,7 +579,7 @@ def _terms(held: Denoised) -> tuple[np.ndarray, np.float32]:
     """(the whole photo in the net's terms, once (in bands, on threads): the pieces are cut
     from it; what it is multiplied by for the net, so that its median sits at MIDDLE)."""
     noisy = held.noisy
-    v = np.empty(noisy.shape, np.float32)
+    v = _small_pages(noisy.shape)
 
     def band(k: int) -> None:
         rows = slice(len(noisy) * k // 8, len(noisy) * (k + 1) // 8)
