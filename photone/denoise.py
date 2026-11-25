@@ -50,13 +50,13 @@ MODELS = Path(__file__).parent / "models"
 # quicker than single precision at 512, and lighter on the card); single precision at 1280 px
 # took 6.3 GB, at 512 1.2 GB.
 MARGIN = 104
-# The older net is told 1.25 times the noise there is (v4_gain_analysis.md, 2026-11-21, measured
-# on v4 and kept for the hybrid until it is measured again): the
-# figures are right (they match the noise read off the photo within some 6 %), but told 1.25
-# times, v4 at 120k leaves no sand in out-of-focus places, nor a faint short line it kept: a
-# stronger hand, not a correction. A raw net is told the noise as it is (1) until a trained
-# one is measured.
-STRENGTH = {"developed": 1.25, "sensor": 1.0}
+# Both nets are told the noise as it is (1). The older net was told 1.25 times (measured on v4,
+# 2026-11-21), and the hybrid kept that unmeasured: told more noise than there is, it drew
+# teal 8 px lattices in dark skies and lost their red. Measured on 119 of the owner's raws
+# (2026-11-25, PLAN.md §4.21): against 1.0, 1.25 added lattices to 4 and took more than 5 % of
+# the red from the darks of 9, while 1.0 leaves grain of about 1 % of the photo's noise,
+# which can't be seen. A raw net stays at 1 until a trained one is measured.
+STRENGTH = {"developed": 1.0, "sensor": 1.0}
 # Whether a raw net, where one is installed, may run: only when Photone is started with
 # --raw-denoise (the owner, 2026-11-22: "disable the RAW denoiser model ... and only enable it
 # with a launch parameter. this is because the first model works great"). Off, every photo
@@ -133,7 +133,12 @@ def of_mosaic(values: np.ndarray, share: float = 1 / 3, period: int = 2) -> tupl
     a band's readings come out the same, in the same order, and are sorted as they were, so
     (a, b) are the same to the last bit. (The masks were 0.6 s of 1.3 for a 33 MP photo.)"""
     signal, spread = _readings(values, period)
-    edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31)))
+    # (A run that shows no noise at all is cut flat: at the sensor's white, or at nothing where
+    # a camera cuts its blacks. Its band read as noiseless and, weighted by that, bent the line
+    # to no slope: IMG_7007, a 700D at ISO 400 with blown lights, came out as a = 0.)
+    signal, spread = signal[spread > 0], spread[spread > 0]
+    edges = (np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31))) if len(signal)
+             else np.zeros(1))
     # (Band i holds edges[i] <= signal < edges[i + 1], as the masks had it.)
     band = np.searchsorted(edges, signal, side="right") - 1
     inside = np.flatnonzero((band >= 0) & (band < len(edges) - 1))
@@ -151,8 +156,13 @@ def of_mosaic(values: np.ndarray, share: float = 1 / 3, period: int = 2) -> tupl
         vs.append((spread_here[calm].mean() / calmest) ** 2)
     xs, vs = np.array(xs, float), np.array(vs, float)
     a, b = np.polyfit(xs, vs, 1, w=1 / np.maximum(vs, 1e-9)) if len(xs) > 1 else (0.0, 0.0)
-    if a <= 0:  # (a picture all of one lightness shows no slope: all of it is b)
-        a, b = 1e-6, float(np.median(vs)) if len(vs) else 1.0
+    if a <= 0 or b > 10 * a * xs.max():
+        # No slope read (a picture of one lightness, or too few readings): half the noise at its
+        # middle lightness is taken as the light's grain, half as the dark's. Never a = 0 (it
+        # was 1e-6): the net's terms then put the whole photo at one value, and the net, given
+        # nothing, drew garbage.
+        x, v = (max(xs[len(xs) // 2], 1.0), vs[len(xs) // 2]) if len(xs) else (1.0, 2.0)
+        a, b = v / 2 / x, v / 2
     return float(a), float(max(b, 1e-6))
 
 
@@ -171,7 +181,7 @@ def known(shape: tuple, iso: float) -> tuple[float, float] | None:
 
 # --- A raw file, as the net wants it -------------------------------------------------------
 
-def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:
+def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:  # noqa: PLR0915
     """((h, w, 3) uint16 scene-linear Rec.2020, the very picture Photone shows at full size;
     what is known of the photo: the camera's `wb` and `cam_xyz`, the noise's `a` and `b` over
     the range `room`, how it is `turned`, the tone curve it starts with (`match`), its `lens`
@@ -198,21 +208,59 @@ def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:
             black, mosaic = float(np.mean(raw.black_level_per_channel)), raw.raw_image_visible
             a, b = known(mosaic.shape, float(raw.other.iso_speed)) or of_mosaic(
                 mosaic - black, period=pattern.shape[0])
-            about = {**camera, "a": a, "b": b, "room": float(raw.white_level - black),
+            about = {**camera, "a": a, "b": b, "room": _room(raw),
                      "match": decode.match_of(raw, camera), "lens": lens.figures(path)}
             if sensor:
-                about.update(_sensed(raw) if pattern.shape == (2, 2) else {"why": "pattern"})
+                about.update(_sensed(raw, about["room"]) if pattern.shape == (2, 2)
+                             else {"why": "pattern"})
             jpeg = _carried(raw)
             rgb = raw.postprocess(half_size=False, gamma=(1, 1), no_auto_bright=True,
                                   output_bps=16, use_camera_wb=True,
                                   output_color=rawpy.ColorSpace.Rec2020,
                                   highlight_mode=rawpy.HighlightMode.Clip)
+            red = _red(raw, rgb.shape, sizes)
     except (rawpy.LibRawError, OSError) as e:
         raise ValueError(f"{path.name} cannot be read as a raw photo ({e}).") from None
     about.update(turned={3: 3, 5: 8, 6: 6}.get(sizes.flip, 1), header=dng.carried(path),
-                 preview=jpeg)
+                 preview=jpeg, red=red, turn={3: 2, 5: 1, 6: 3}.get(sizes.flip, 0))
     _fit(about, rgb.shape, sizes)
     return np.ascontiguousarray(rgb[decode.kept(sizes, False)]), about
+
+
+def _room(raw) -> float:
+    """The range of the sensor's values (black off) the developed picture spans from 0 to 1:
+    the sensor's white, or, as LibRaw develops with rawpy's default adjust_maximum_thr of 0.75
+    (as `develop` and decode.py do), the photo's brightest value where that is above 75 % of
+    the white and below it (LibRaw's adjust_maximum: the visible mosaic's largest value less
+    its color's black). Such a picture is brighter by k = white / brightest: 20 of the owner's
+    119 test raws, up to 1.29 times. Neuro trains the older net on pictures developed at 0 (the
+    sensor's white). With the noise's a and b over this range, the net's terms (`Denoised`)
+    give it the photo at the trained brightness and turn its result back to the shown one,
+    exactly: room / k makes slope k times and floor k^2 times, and the v of k x is then the v
+    of x. A raw net's mosaic is put over it too, so that its result is as bright as the picture.
+    (Measured, 2026-11-25, PLAN.md §4.21: LibRaw's factor to 1e-4 on all 119.)"""
+    black, cells = raw.black_level_per_channel, raw.raw_colors_visible
+    seen, n = raw.raw_image_visible, len(raw.raw_pattern)
+    room = float(raw.white_level - np.mean(black))
+    top = max(int(seen[y::n, x::n].max()) - black[cells[y, x]]
+              for y in range(n) for x in range(n))
+    return float(top) if 0.75 * room < top < room else room
+
+
+def _red(raw, shape: tuple, sizes) -> tuple[int, int]:
+    """Where the first red is in the developed picture as the older net is given it: cut to
+    the photo (decode.kept) and, turned upright by LibRaw, turned back (`run`), (0, 0) to
+    (1, 1). That net was trained with red at the top-left pixel and draws a teal maze a pixel
+    off, so its pieces begin there (`_pieces`): a sensor may begin with another color, and
+    the cut may take an odd row or column. (0, 0) where it can't be told: no 2 x 2 mosaic, no
+    red, or a picture of another size than the sensor's."""
+    turn = {3: 2, 5: 1, 6: 3}.get(sizes.flip, 0)
+    colors = np.rot90(raw.raw_colors_visible, turn)
+    if raw.raw_pattern.shape != (2, 2) or colors.shape != tuple(shape[:2]):
+        return (0, 0)
+    corner = np.rot90(colors[decode.kept(sizes, False)], -turn)[:2, :2]
+    hits = np.argwhere(corner == raw.color_desc.decode().find("R"))
+    return (int(hits[0][0]), int(hits[0][1])) if len(hits) else (0, 0)
 
 
 def _fit(about: dict, shape: tuple, sizes) -> None:
@@ -229,11 +277,11 @@ def _fit(about: dict, shape: tuple, sizes) -> None:
                            kept=decode.kept(sizes, False))
 
 
-def _sensed(raw) -> dict:
+def _sensed(raw, room: float) -> dict:
     """{"sensed": what a raw net takes of a 2 x 2 mosaic (Neuro's PLAN.md §4.40): `mosaic`,
-    the sensor's values over its range, each color's black off, from its first red (`at`: a
-    row and a column are lost where the order is not RGGB), an even number each way; and the
-    `mosaic_size` of all of it}."""
+    the sensor's values over the picture's `room` (`_room`), each color's black off, from its
+    first red (`at`: a row and a column are lost where the order is not RGGB), an even number
+    each way; and the `mosaic_size` of all of it}."""
     letters = raw.color_desc.decode()
     at = next((y, x) for y in (0, 1) for x in (0, 1) if letters[raw.raw_pattern[y, x]] == "R")
     seen, (dy, dx) = raw.raw_image_visible, at
@@ -241,7 +289,7 @@ def _sensed(raw) -> dict:
     black = np.array(raw.black_level_per_channel, np.float32)[
         raw.raw_colors_visible[dy:dy + h, dx:dx + w]]
     mosaic = seen[dy:dy + h, dx:dx + w] - black
-    mosaic /= np.float32(raw.white_level - float(np.mean(raw.black_level_per_channel)))
+    mosaic /= np.float32(room)
     return {"sensed": {"mosaic": mosaic, "at": at, "mosaic_size": seen.shape}}
 
 
@@ -318,10 +366,15 @@ class Denoised:
 
     def sensed(self, mosaic: np.ndarray) -> np.ndarray:
         """(h, w) an RGGB mosaic (the sensor's values over its range, black off) -> v, each
-        pixel in its own color's terms: `into` with the white balance alone."""
+        pixel in its own color's terms: `into` with the white balance alone. Each color is cut
+        at the sensor's white once balanced, as LibRaw's is for the developed picture
+        (HighlightMode.Clip): a blown light, white there, is (1, 1, 1). Uncut, its red and blue
+        stood at their gains over a green of 1, and the net drew it magenta (the owner: "the
+        mosaic model seems to clip highlights into magenta")."""
         v = np.empty(mosaic.shape, np.float32)
         for (dy, dx), c in zip(((0, 0), (0, 1), (1, 0), (1, 1)), (0, 1, 1, 2), strict=True):
             part = mosaic[dy::2, dx::2] * np.float32(self.gain[c])
+            np.minimum(part, 1, out=part)
             part += self.offset[c]
             np.sqrt(np.maximum(part, 0, out=part), out=part)
             v[dy::2, dx::2] = part * self.scale[c]
@@ -499,7 +552,17 @@ def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     v, norm = _sensor_terms(held, about["sensed"]) if held.kind == "sensor" else _terms(held)
     # (the raw net's result is of the mosaic, from its first red: put in place after, `_upright`)
     out = np.empty((*v.shape[:2], 3), np.float32) if held.kind == "sensor" else held.clean
-    _pieces(net, v, norm * STRENGTH[held.kind], norm, out, held, progress, stopped)
+    # (The raw net's mosaic begins at its first red. The older net is given the developed
+    # picture as the sensor has it, LibRaw's turn undone, as it was trained: the dark frames
+    # are added to its tiles after their turn, so the sensor's rows (banding, rows off by a
+    # little) are rows to it, and in a portrait as LibRaw turns it they ran down. Its result
+    # lands in `out` turned, through the same view. Pieces begin where red is, `_red`.
+    # LibRaw's flip is exactly np.rot90 of its unturned picture: measured to the pixel on
+    # flip 3 and 5 photos, and on flip 6 by the check.)
+    turn, red = (0, (0, 0)) if held.kind == "sensor" else (about.get("turn", 0),
+                                                            about.get("red", (0, 0)))
+    _pieces(net, np.rot90(v, -turn), norm * STRENGTH[held.kind], norm, np.rot90(out, -turn),
+            held, progress, stopped, red)
     if held.kind == "sensor":
         _upright(held, about["sensed"], out)
     return held
@@ -526,11 +589,14 @@ def chosen(about: dict, found: dict) -> tuple[str, str, Path | None]:
 
 
 def _pieces(net, v: np.ndarray, told, norm, out: np.ndarray, held: Denoised,  # noqa: PLR0913
-            progress, stopped) -> None:
+            progress, stopped, red: tuple[int, int] = (0, 0)) -> None:
     """`v` through the net into `out`, a piece at a time, each with the net's margin; the net
-    told the noise is `told` (`norm`, or more: STRENGTH)."""
+    told the noise is `told` (`norm`, or more: STRENGTH). The pieces begin at `red` (`_red`)
+    less whole pieces, so that each has red at its top-left pixel: the first ones begin above
+    or left of the picture, mirrored there (`_piece`), which keeps the colors' order. (The
+    kept part and the margin are even.)"""
     kept_, m = net.piece - 2 * net.margin, net.margin
-    places = list(product(range(0, v.shape[0], kept_), range(0, v.shape[1], kept_)))
+    places = list(product(range(-red[0], v.shape[0], kept_), range(-red[1], v.shape[1], kept_)))
     if progress:
         progress(0, len(places), net.where)
     sigma = np.full((1, 1, 1, 1), told, np.float32)
@@ -545,9 +611,11 @@ def _pieces(net, v: np.ndarray, told, norm, out: np.ndarray, held: Denoised,  # 
         for done, ((y, x), seen) in enumerate(zip(places, pieces, strict=True)):
             if stopped and stopped():
                 raise Stopped
-            kept = out[y:y + kept_, x:x + kept_]
-            kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[m:m + kept.shape[0],
-                                                               m:m + kept.shape[1]] / norm
+            top, left = max(y, 0), max(x, 0)
+            kept = out[top:y + kept_, left:x + kept_]
+            top, left = m + top - y, m + left - x
+            kept[...] = net(seen, sigma)[0].transpose(1, 2, 0)[top:top + kept.shape[0],
+                                                               left:left + kept.shape[1]] / norm
             held.where = net.where
             if progress:
                 progress(done + 1, len(places), net.where)

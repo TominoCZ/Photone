@@ -2953,7 +2953,7 @@ def check_denoise_kinds() -> None:
     y, x = np.mgrid[0:150, 0:230].astype(np.float32)
     scene = np.stack([0.05 + 0.3 * x / 230, np.full_like(x, 0.2), 0.04 + 0.2 * y / 150], 2)  # (camera colors)
     for order, turn in (((0, 1, 3, 2), 0), ((1, 0, 2, 3), 1), ((2, 3, 1, 0), 2), ((3, 2, 0, 1), 3)):
-        sensed = denoise._sensed(_Sensor(scene, order))["sensed"]
+        sensed = denoise._sensed(_Sensor(scene, order), 15000.0)["sensed"]
         flip = {0: 0, 1: 5, 2: 3, 3: 6}[turn]
         size = (230, 150) if turn % 2 else (150, 230)
         sizes = types.SimpleNamespace(flip=flip, width=230, height=150, crop_width=0, crop_height=0,
@@ -2969,6 +2969,11 @@ def check_denoise_kinds() -> None:
         want = np.rot90(np.stack([_own(held, scene, c) for c in range(3)], 2), turn)
         off = np.abs(held.clean - want) / want
         assert held.clean.shape == want.shape and np.median(off) < 0.005 and np.percentile(off, 99) < 0.05, (order, turn, np.median(off), np.percentile(off, 99))
+    # A blown light (the sensor at its white, or over it) goes to the net white, as LibRaw cuts
+    # it once balanced: (1, 1, 1) in the camera's colors, not red and blue at their gains.
+    v = held.sensed(np.full((4, 4), 1.01, np.float32))
+    cam = held.camera(np.stack([v[0::2, 0::2], v[0::2, 1::2], v[1::2, 1::2]], 2))
+    assert np.allclose(cam, 1, atol=1e-4), ("a blown light drawn magenta", cam[0, 0])
     # X-Trans: its colors repeat every 6 x 6, and its noise is read 6 apart, not 2.
     rng, xtrans = np.random.default_rng(5), np.array([[1, 1, 0, 1, 1, 2], [1, 1, 2, 1, 1, 0], [2, 0, 1, 0, 2, 1],
                                                       [1, 1, 2, 1, 1, 0], [1, 1, 0, 1, 1, 2], [0, 2, 1, 2, 0, 1]])
@@ -2977,6 +2982,123 @@ def check_denoise_kinds() -> None:
     a, b = denoise.of_mosaic(noisy, period=6)
     assert abs(a / 2 - 1) < 0.15 and abs(b / 40 - 1) < 0.5, (a, b)
     assert denoise.of_mosaic(noisy)[0] > 4 or denoise.of_mosaic(noisy)[1] > 400, "read 2 apart, its colors pass for noise"
+
+
+def check_denoise_phase() -> None:
+    """The older net sees the photo as the sensor has it (a portrait's or an upside-down
+    photo's turn undone) with red at the top-left pixel of every piece, as it was trained; its
+    result given back turned as LibRaw turns the picture, in place; and the noise read off a
+    photo with blown lights, never none."""
+    # Red in the developed picture as the net is given it, the sensor's way round: where the
+    # sensor has it whichever way the photo is turned (flip 5 a portrait, 3 upside down); a
+    # sensor that begins with blue, one down and one across. (A 2 x 2 cell: 0 red, 1 green,
+    # 2 blue, 3 green.)
+    scene = np.zeros((40, 60, 3), np.float32)
+    for order, flip, want in (((0, 1, 3, 2), 0, (0, 0)), ((0, 1, 3, 2), 5, (0, 0)),
+                              ((0, 1, 3, 2), 3, (0, 0)), ((2, 3, 1, 0), 0, (1, 1))):
+        sizes = types.SimpleNamespace(flip=flip, width=60, height=40, crop_width=0, crop_height=0,
+                                      crop_left_margin=0, left_margin=0, crop_top_margin=0, top_margin=0)
+        shape = (60, 40) if flip in (5, 6) else (40, 60)
+        assert denoise._red(_Sensor(scene, order), shape, sizes) == want, (order, flip, denoise._red(_Sensor(scene, order), shape, sizes))
+
+    # A net that gives back what it is given, and says whether red was at the top-left of each
+    # piece: the picture comes back exactly, wherever red begins.
+    class Same:
+        piece, margin, where = 64, 8, "the processor"
+
+        def __call__(self, seen, sigma):
+            assert (seen[0, 0, ::2, ::2] == 1).all() and (seen[0, 0, 1::2, :] != 1).all(), "a piece out of phase"
+            return seen
+
+    rng = np.random.default_rng(3)
+    for red in ((0, 0), (1, 0), (1, 1), (0, 1)):
+        v = rng.random((101, 130, 3)).astype(np.float32) * 0.5
+        v[..., 0] = 0
+        v[red[0]::2, red[1]::2, 0] = 1  # (red's place, the picture's own pixels otherwise)
+        out = np.full_like(v, np.nan)
+        denoise._pieces(Same(), v, 1.0, np.float32(1), out, types.SimpleNamespace(), None, None, red)
+        assert (out == v).all(), ("the pieces not given back in place", red)
+
+    # A portrait (flip 6) and an upside-down photo (3) as raw files LibRaw reads, a sensor of
+    # blue first (red one down, one across), lighter down its rows, cut to the photo three rows
+    # and columns short of its far edges: the net is given it the sensor's way round (lighter
+    # down its own rows: not turned, nor half turned), red where `_red` says, and its result
+    # (what it was given) comes back as LibRaw turns the picture.
+    class Upright:
+        piece, margin, where, on = 64, 8, "the processor", denoise.PROCESSOR
+
+        def __call__(self, seen, sigma):
+            rows, columns = seen[0].mean(axis=(0, 2)), seen[0].mean(axis=(0, 1))
+            assert rows[11] - rows[9] > 1e-3 > 100 * abs(columns[11] - columns[9]), ("the net given the photo turned", rows[9:12], columns[9:12])
+            return seen
+
+    mosaic = np.repeat(np.linspace(1000, 9000, 100)[:, None], 150, 1).astype("<u2")
+    real = denoise._Net, denoise.models
+    try:
+        denoise._Net, denoise.models = (lambda _: Upright()), (lambda: {"developed": Path("upright.onnx"), "sensor": None})
+        with tempfile.TemporaryDirectory() as folder:
+            for flip, size in ((6, (143, 95)), (3, (95, 143))):
+                held = denoise.run(_mosaic_dng(Path(folder) / f"turned-{flip}.dng", mosaic, flip))
+                assert held.about["red"] == (1, 1) and held.noisy.shape[:2] == size, (flip, held.about["red"], held.noisy.shape)
+                assert np.allclose(held.clean, held.into(held.noisy), rtol=1e-5, atol=1e-5), ("the result not turned as LibRaw turns the picture", flip)
+    finally:
+        denoise._Net, denoise.models = real
+
+    # A photo with blown lights (cut flat at the sensor's white): its noise read as the light's
+    # grain it has (3), not as none (IMG_7007, a 700D: a = 1e-6, the net given one flat value).
+    y, x = np.mgrid[0:600, 0:960]
+    light = 230 + 9000 * (x / 960) ** 2 + 200 * np.sin(y / 7)
+    seen = np.minimum(light + rng.standard_normal(light.shape) * np.sqrt(3 * light + 40), 8000)
+    a, b = denoise.of_mosaic(np.round(seen))
+    assert 2.4 < a < 3.6, ("the noise read as none", a, b)
+    # (No slope to read: flat, its line by chance nearly level (a = 0.005, b = 98); nothing.)
+    for flat in (np.random.default_rng(0).normal(500, 10, (640, 960)), np.zeros((40, 30))):
+        a, b = denoise.of_mosaic(flat)
+        assert a * 500 > 0.1 * b and a > 1e-3, ("no light's grain: the net given one flat value", a, b)
+
+
+def _mosaic_dng(path: Path, mosaic: np.ndarray, flip: int = 1) -> Path:
+    """A raw file LibRaw reads: `mosaic` (100 x 150, uint16) from a sensor of blue first (red
+    one down, one across), black 512, white 16000, cut to 143 x 95 from (4, 2); turned `flip`."""
+    tags = {254: (4, 0), 256: (4, 150), 257: (4, 100), 258: (3, 16), 259: (3, 1), 262: (3, 32803),
+            271: (2, "Canon"), 272: (2, "Canon EOS 90D"), 273: (4, 0), 274: (3, flip), 277: (3, 1), 278: (4, 100), 279: (4, mosaic.nbytes), 284: (3, 1),
+            33421: (3, [2, 2]), 33422: (1, bytes([2, 1, 1, 0])), 50706: (1, bytes([1, 4, 0, 0])),
+            50714: (4, 512), 50717: (4, 16000), 50719: (4, [4, 2]), 50720: (4, [143, 95]), 50728: (5, [1 / 2.4, 1, 1 / 1.6]), 50778: (3, 21)}
+    tags[273] = (4, 8 + dng._size_of(tags))
+    path.write_bytes(b"II*\0" + struct.pack("<I", 8) + dng._directory(tags, 8) + mosaic.tobytes())
+    return path
+
+
+def check_denoise_brightness() -> None:
+    """A photo whose brightest value is between 75 % and 100 % of its white: LibRaw (rawpy's
+    adjust_maximum_thr, 0.75 unless told) takes that value for white, so the picture Photone
+    shows is brighter by white / brightest. The older net is given the photo as bright as Neuro
+    trained it (developed at 0: the sensor's white), and its result is as bright as shown."""
+    import rawpy
+
+    # A gray scene, lighter to the right, its brightest green 86 % of white; red and blue a
+    # little under it once balanced, so that no color is cut at white in either picture.
+    y, x = np.mgrid[0:100, 0:150]
+    light = 400 + 13000 * (x / 149) * (0.6 + 0.4 * y / 99)
+    light[0::2, 0::2] *= 0.98 / 1.6  # (blue first: blue, green / green, red)
+    light[1::2, 1::2] *= 0.98 / 2.4
+    mosaic = (512 + light).astype("<u2")
+    figures = {"half_size": False, "gamma": (1, 1), "no_auto_bright": True, "output_bps": 16, "use_camera_wb": True,
+               "output_color": rawpy.ColorSpace.Rec2020, "highlight_mode": rawpy.HighlightMode.Clip}
+    with tempfile.TemporaryDirectory() as folder:
+        path = _mosaic_dng(Path(folder) / "bright.dng", mosaic)
+        noisy, about = denoise.develop(path)
+        with rawpy.imread(str(path)) as raw:
+            kept = decode.kept(raw.sizes, False)
+            shown, trained = raw.postprocess(**figures)[kept], raw.postprocess(adjust_maximum_thr=0.0, **figures)[kept]
+    assert (noisy == shown).all() and about["room"] == mosaic.max() - 512, ("the picture shown changed", about["room"])
+    held = denoise.Denoised(noisy, about)
+    v, norm = denoise._terms(held)
+    v0, norm0 = denoise._terms(denoise.Denoised(trained, {**about, "room": 15488.0}))
+    off = np.abs(v - v0)
+    assert np.median(off) < 0.01 and np.percentile(off, 99) < 0.1 and abs(norm / norm0 - 1) < 1e-3, ("the net given the photo brighter than it was trained on", np.median(off), norm, norm0)
+    held.clean[...] = v  # (a net that gives back what it is given)
+    assert np.allclose(held.picture()[..., :3], shown / 65535, rtol=2e-3, atol=1e-4), "the net's result not as bright as the photo shown"
 
 
 def _own(held, scene: np.ndarray, c: int) -> np.ndarray:
@@ -3025,7 +3147,8 @@ def check_denoise_exact() -> None:
         signal = np.concatenate([r.mean(axis=2).ravel() for r in runs])
         spread = np.concatenate([np.median(np.abs(r[:, :, 2:] - r[:, :, :-2]), axis=2).ravel()
                                  / 0.6745 / np.sqrt(2) for r in runs])
-        edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31)))
+        signal, spread = signal[spread > 0], spread[spread > 0]  # (cut flat: no noise to read)
+        edges = np.unique(np.percentile(signal, np.linspace(0.5, 99.5, 31))) if len(signal) else np.zeros(1)
         xs, vs = [], []
         for low, high in pairwise(edges):
             here = (signal >= low) & (signal < high)
@@ -3035,8 +3158,9 @@ def check_denoise_exact() -> None:
                 vs.append((spread[here][calm].mean() / denoise._calmest(share)) ** 2)
         xs, vs = np.array(xs, float), np.array(vs, float)
         a, b = np.polyfit(xs, vs, 1, w=1 / np.maximum(vs, 1e-9)) if len(xs) > 1 else (0.0, 0.0)
-        if a <= 0:
-            a, b = 1e-6, float(np.median(vs)) if len(vs) else 1.0
+        if a <= 0 or b > 10 * a * xs.max():  # (no slope: half of the middle's noise is light's)
+            x, v = (max(xs[len(xs) // 2], 1.0), vs[len(xs) // 2]) if len(xs) else (1.0, 2.0)
+            a, b = v / 2 / x, v / 2
         return float(a), float(max(b, 1e-6))
 
     y, x = np.mgrid[0:480, 0:960]
@@ -3196,6 +3320,8 @@ def main() -> None:
     check_denoise()
     check_denoise_refused()
     check_denoise_kinds()
+    check_denoise_phase()
+    check_denoise_brightness()
     check_denoise_exact()
     check_workers()
     check_no_orphan()
