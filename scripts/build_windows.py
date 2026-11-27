@@ -75,6 +75,9 @@ def fetch(packages: list[str], to: Path) -> None:
     else:
         tool = [sys.executable, "-m", "pip", "install", "--platform", "win_amd64",
                 "--implementation", "cp", "--disable-pip-version-check"]
+    # (wheels from outside PyPI, as pyproject.toml lists them: the rawpy fork's release)
+    links = tomllib.loads((HERE / "pyproject.toml").read_text("utf-8"))["tool"]["uv"]["find-links"]
+    tool += [part for link in links for part in ("--find-links", link)]
     subprocess.run([*tool, "--no-deps", "--only-binary", ":all:", "--python-version",
                     PYTHON.rpartition(".")[0], "--target", str(to), *packages], check=True)
 

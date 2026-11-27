@@ -7,7 +7,9 @@ license-files = ["LICENSE", "photone/ui/fonts/OFL.txt"]
 requires-python = ">=3.12"
 dependencies = [
     "PySide6>=6.8",   # Qt Quick: the window, the interface, and the GPU surface (SDR or HDR)
-    "rawpy==0.28.0",  # LibRaw 0.22.2, bundled in the wheel: decodes camera raw files. Pinned (docs/deps.md)
+    # LibRaw snapshot 202611, bundled in the wheel: decodes camera raw files. Pinned, and built
+    # by our rawpy fork until a rawpy release carries this LibRaw (docs/deps.md)
+    "rawpy==0.28.0+libraw202611",
     "numpy>=2.0",     # the pixel arrays rawpy returns, packed for the GPU
     # ONNX Runtime runs the neural denoiser's net (photone/denoise.py). On Linux its CUDA
     # build with NVIDIA's libraries as wheels (some 2 GB; any other card there: the processor);
@@ -18,6 +20,11 @@ dependencies = [
 
 [project.scripts]
 photone = "photone.__main__:main"
+
+[tool.uv]
+# The rawpy fork's wheels (Windows and Linux, x86-64), from its GitHub release
+find-links = ["https://github.com/TominoCZ/rawpy/releases/expanded_assets/v0.28.0-libraw202611"]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'", "sys_platform == 'win32' and platform_machine == 'AMD64'"]
 
 [build-system]
 requires = ["hatchling"]

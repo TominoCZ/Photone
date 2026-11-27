@@ -30,7 +30,7 @@ Windows 10 version 1903 or later (Qt loads the system's `icuuc.dll`) and a GPU w
 
 | Package | Pinned at | Why |
 |---|---|---|
-| rawpy | `==0.28.0` (LibRaw 0.22.2 inside) | Neural Denoise's net is trained on pictures developed by this LibRaw, in Neuro, from data built by Denoiser's `pairs_v2.py`. Its input in Photone must be developed the same way. A LibRaw with a changed demosaic or colour step would feed the net a picture it wasn't trained on. Neuro pins the same version, and its GPU copy of LibRaw's development matches 0.22.2 bit for bit. Upgrade both together, and only after Neuro's check against rawpy passes on the new version. |
+| rawpy | `==0.28.0+libraw202611` (LibRaw 0.23.0-Snapshot202611, commit 211ec934, inside), from the fork [TominoCZ/rawpy](https://github.com/TominoCZ/rawpy) branch `libraw-202611`, wheels for Windows and Linux on x86-64 in its release `v0.28.0-libraw202611` (`[tool.uv] find-links`) | LibRaw 0.22.2 read wrong per-channel blacks for the Canon EOS R6 Mark III (an orange cast and a maze) and had no matrix for the GFX100RF; no rawpy release carries the fix yet. Pinned because Neural Denoise's net is trained on pictures developed by LibRaw in Neuro, and Photone's GPU development (ui/Develop.qml) copies LibRaw's: a LibRaw with a changed demosaic or colour step would change both. 0.22.2 → this snapshot leaves development unchanged (Bayer bit-identical) and changes only metadata for a few cameras (R6 III, R50, R6 II, Sony ILCE-1M2 and 7M5, Panasonic S1 II family, GFX100RF, RX1R III, R10) plus X-Trans fixes. The lock has no hashes for these wheels (the release page gives none). Go back to PyPI once a rawpy release bundles snapshot 202611 or later. |
 
 ## Development only (not shipped)
 
