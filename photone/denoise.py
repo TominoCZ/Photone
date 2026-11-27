@@ -3,9 +3,9 @@
 Two kinds of net, each an ONNX file in models/ (Neuro's export: its PLAN.md §4.40), told apart
 by the file itself (`model`): a raw net, which takes the sensor's own data and demosaics as it
 denoises, and the older net, which takes the photo after LibRaw has demosaiced it. The raw
-net is used where there is one and the photo's sensor is a 2 x 2 mosaic (`sensed`); the older
-one for every other photo (Fujifilm's X-Trans, say), and for all of them while no raw net is
-installed. The window says which ran, and why (`Denoised.why`).
+net is used where the photo's sensor is a 2 x 2 mosaic (`sensed`), unless the older one is
+asked for (`run`'s `want`: the window's Model); the older one for every other photo (Fujifilm's
+X-Trans, say). The window says which ran, and why (`Denoised.why`).
 
 Either sees the photo in the camera's own colors with each made to have noise of one unit at
 any brightness (v = scale * sqrt(x + offset)), scaled so that its median sits at MIDDLE. The
@@ -57,11 +57,6 @@ MARGIN = 104
 # the red from the darks of 9, while 1.0 leaves grain of about 1 % of the photo's noise,
 # which can't be seen. A raw net stays at 1 until a trained one is measured.
 STRENGTH = {"developed": 1.0, "sensor": 1.0}
-# Whether a raw net, where one is installed, may run: only when Photone is started with
-# --raw-denoise (the owner, 2026-11-22: "disable the RAW denoiser model ... and only enable it
-# with a launch parameter. this is because the first model works great"). Off, every photo
-# goes through the older net, and Denoise says nothing of the raw one, as with none installed.
-RAW_NET = False
 MIDDLE = 0.25
 # The noise of the cameras measured, by ISO: a per unit of ISO (the light's grain) and b at
 # each ISO (the dark's: the spread of cap-on frames, squared), in the raw file's numbers.
@@ -208,16 +203,16 @@ def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:  # noq
             black, mosaic = float(np.mean(raw.black_level_per_channel)), raw.raw_image_visible
             a, b = known(mosaic.shape, float(raw.other.iso_speed)) or of_mosaic(
                 mosaic - black, period=pattern.shape[0])
-            about = {**camera, "a": a, "b": b, "room": _room(raw),
+            # The range of the sensor's values (black off) the developed picture spans from 0 to
+            # 1: the sensor's white, as Neuro trained the older net (adjust_maximum off).
+            room = float(raw.white_level - np.mean(raw.black_level_per_channel))
+            about = {**camera, "a": a, "b": b, "room": room,
                      "match": decode.match_of(raw, camera), "lens": lens.figures(path)}
             if sensor:
                 about.update(_sensed(raw, about["room"]) if pattern.shape == (2, 2)
                              else {"why": "pattern"})
             jpeg = _carried(raw)
-            rgb = raw.postprocess(half_size=False, gamma=(1, 1), no_auto_bright=True,
-                                  output_bps=16, use_camera_wb=True,
-                                  output_color=rawpy.ColorSpace.Rec2020,
-                                  highlight_mode=rawpy.HighlightMode.Clip)
+            rgb = decode.developed(raw, False)
             red = _red(raw, rgb.shape, sizes)
     except (rawpy.LibRawError, OSError) as e:
         raise ValueError(f"{path.name} cannot be read as a raw photo ({e}).") from None
@@ -225,26 +220,6 @@ def develop(path: Path, sensor: bool = False) -> tuple[np.ndarray, dict]:  # noq
                  preview=jpeg, red=red, turn={3: 2, 5: 1, 6: 3}.get(sizes.flip, 0))
     _fit(about, rgb.shape, sizes)
     return np.ascontiguousarray(rgb[decode.kept(sizes, False)]), about
-
-
-def _room(raw) -> float:
-    """The range of the sensor's values (black off) the developed picture spans from 0 to 1:
-    the sensor's white, or, as LibRaw develops with rawpy's default adjust_maximum_thr of 0.75
-    (as `develop` and decode.py do), the photo's brightest value where that is above 75 % of
-    the white and below it (LibRaw's adjust_maximum: the visible mosaic's largest value less
-    its color's black). Such a picture is brighter by k = white / brightest: 20 of the owner's
-    119 test raws, up to 1.29 times. Neuro trains the older net on pictures developed at 0 (the
-    sensor's white). With the noise's a and b over this range, the net's terms (`Denoised`)
-    give it the photo at the trained brightness and turn its result back to the shown one,
-    exactly: room / k makes slope k times and floor k^2 times, and the v of k x is then the v
-    of x. A raw net's mosaic is put over it too, so that its result is as bright as the picture.
-    (Measured, 2026-11-25, PLAN.md §4.21: LibRaw's factor to 1e-4 on all 119.)"""
-    black, cells = raw.black_level_per_channel, raw.raw_colors_visible
-    seen, n = raw.raw_image_visible, len(raw.raw_pattern)
-    room = float(raw.white_level - np.mean(black))
-    top = max(int(seen[y::n, x::n].max()) - black[cells[y, x]]
-              for y in range(n) for x in range(n))
-    return float(top) if 0.75 * room < top < room else room
 
 
 def _red(raw, shape: tuple, sizes) -> tuple[int, int]:
@@ -279,7 +254,7 @@ def _fit(about: dict, shape: tuple, sizes) -> None:
 
 def _sensed(raw, room: float) -> dict:
     """{"sensed": what a raw net takes of a 2 x 2 mosaic (Neuro's PLAN.md §4.40): `mosaic`,
-    the sensor's values over the picture's `room` (`_room`), each color's black off, from its
+    the sensor's values over the picture's `room` (`develop`), each color's black off, from its
     first red (`at`: a row and a column are lost where the order is not RGGB), an even number
     each way; and the `mosaic_size` of all of it}."""
     letters = raw.color_desc.decode()
@@ -338,7 +313,8 @@ class Denoised:
         self.clean = _small_pages(noisy.shape)
         self.where = ""  # what the net ran on: "CUDA", "DirectML" or "the processor"
         # Which net ran: "sensor" (the raw net) or "developed" (the older one); and why not
-        # the raw net: "pattern", "layout" (develop), "missing" (no raw net is installed).
+        # the raw net: "pattern", "layout" (develop), "missing" (no raw net is installed),
+        # "asked" (the older one was asked for).
         self.kind, self.why, self.model = "", about.get("why", ""), None
         wb = np.array(about["wb"], np.float64)
         self.gain = wb / wb.min()  # what the decoder multiplied each of the camera's colors by
@@ -522,9 +498,10 @@ class _Net:
             f"{self.on}, and {PROCESSOR} for {self.slowly} of {self.pieces} pieces")
 
 
-def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
+def run(path: Path, progress=None, stopped=None, step=None, want: str = "sensor") -> Denoised:
     """The photo at `path` through a net, a piece at a time: the raw net where there is one
-    and the photo's sensor allows it, else the older one. `progress(done, of, where)` is
+    and the photo's sensor allows it, else the older one; the older one too where it is the
+    one asked for (`want`: "developed"). `progress(done, of, where)` is
     called after each piece (and once before the first: 0 of them), `where` saying what the
     net runs on; `stopped()` true ends it with `Stopped`; `step(words)` says what it is doing
     before the pieces count (a cold start spends seconds there: the photo read, the net
@@ -533,21 +510,24 @@ def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     step = step or (lambda _: None)
     step("Reading photo")
     found = models()
-    if not RAW_NET:
-        found["sensor"] = None
-    # (Where the older net is the one there is, the photo is read on a thread while the net
+    # (Where the older net is the one that will run, the photo is read on a thread while the net
     # is loaded and warmed up on this one, the thread that runs it: ONNX Runtime readies the
     # GPU for each thread that uses it, so warmed on another it is readied again here.)
     with ThreadPoolExecutor(1) as early:
         reading = early.submit(develop, path, sensor=found["sensor"] is not None)
-        warm = _warmed(found["developed"]) if found["developed"] and not found["sensor"] else None
+        older = want == "developed" or not found["sensor"]
+        warm = _warmed(found["developed"]) if found["developed"] and older else None
         noisy, about = reading.result()
+    # (Stopped between its steps too, not only between pieces: another model picked while
+    # this one is still reading or loading must not wait for it, nor share the card with it.)
+    _go_on(stopped)
     held = Denoised(noisy, about)
-    held.kind, held.why, held.model = chosen(about, found)
+    held.kind, held.why, held.model = chosen(about, found, want)
     if held.model is None:
         raise ValueError("No denoiser is installed: its file is missing from Photone's models.")
     step("Loading model")
     net = warm or _Net(held.model)
+    _go_on(stopped)
     step("Warming up")
     v, norm = _sensor_terms(held, about["sensed"]) if held.kind == "sensor" else _terms(held)
     # (the raw net's result is of the mosaic, from its first red: put in place after, `_upright`)
@@ -568,6 +548,12 @@ def run(path: Path, progress=None, stopped=None, step=None) -> Denoised:
     return held
 
 
+def _go_on(stopped) -> None:
+    """`Stopped`, where the run is no longer wanted (`run`'s `stopped`)."""
+    if stopped and stopped():
+        raise Stopped
+
+
 def _warmed(path: Path) -> _Net:
     """The net, with a piece of nothing put through it on the GPU: its first piece there
     spends half a second readying the GPU's libraries. (Refused, it is left to the first
@@ -580,12 +566,14 @@ def _warmed(path: Path) -> _Net:
     return net
 
 
-def chosen(about: dict, found: dict) -> tuple[str, str, Path | None]:
+def chosen(about: dict, found: dict, want: str = "sensor") -> tuple[str, str, Path | None]:
     """(which net: "sensor" or "developed"; why not the raw one: "" where it is, "pattern",
-    "layout" (develop) or "missing" (none installed); its file) for a photo `develop`ed with
-    a raw net asked for where `found` (`models`) has one."""
-    kind = "sensor" if "sensed" in about else "developed"
-    return kind, "" if kind == "sensor" else about.get("why") or "missing", found[kind]
+    "layout" (develop), "missing" (none installed) or "asked" (it could have been: `want` is
+    the older one); its file) for a photo `develop`ed with a raw net asked for where `found`
+    (`models`) has one."""
+    if "sensed" not in about:
+        return "developed", about.get("why") or "missing", found["developed"]
+    return (want, "asked", found[want]) if want == "developed" else ("sensor", "", found["sensor"])
 
 
 def _pieces(net, v: np.ndarray, told, norm, out: np.ndarray, held: Denoised,  # noqa: PLR0913
@@ -802,7 +790,7 @@ class Denoiser(QObject):
     def why(self) -> str:
         """Why the older net ran: "pattern" (a sensor not of 2 x 2 cells, as X-Trans),
         "layout" (a file whose picture is not its sensor's size), "missing" (no raw net is
-        installed); "" otherwise."""
+        installed), "asked" (the user's pick); "" otherwise."""
         return self.held.why if self.held else ""
 
     @Property(str, notify=changed)
@@ -840,19 +828,21 @@ class Denoiser(QObject):
         self.changed.emit()
 
     @Slot(str)
-    def start(self, path: str) -> None:
-        """That photo through the net. Whatever was under way or kept is let go."""
+    @Slot(str, str)
+    def start(self, path: str, want: str = "sensor") -> None:
+        """That photo through the net asked for ("sensor", where the photo can: `chosen`; or
+        "developed"). Whatever was under way or kept is let go."""
         self._run += 1
         self.held, self.pixels, self._path, self._where = None, None, Path(path), ""
         self._step = "Reading photo"
         self._set("working")
-        threading.Thread(target=self._work, args=(self._run, self._path), daemon=True,
+        threading.Thread(target=self._work, args=(self._run, self._path, want), daemon=True,
                          name="denoise").start()
 
-    def _work(self, mine: int, path: Path) -> None:
+    def _work(self, mine: int, path: Path, want: str = "sensor") -> None:
         try:
             held = run(path, lambda done, of, on: self.stepped.emit(mine, done / max(of, 1), on),
-                       lambda: mine != self._run, lambda words: self.phased.emit(mine, words))
+                       lambda: mine != self._run, lambda words: self.phased.emit(mine, words), want)
             self.finished.emit(mine, (held, held.picture()))
         except Stopped:
             pass

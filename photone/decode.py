@@ -77,11 +77,12 @@ def camera(wb, cam_xyz) -> dict | None:
     return {"wb": (wb / wb[1]).tolist(), "cam_xyz": cam_xyz.tolist()}
 
 
-def sampled(raw) -> np.ndarray | None:
+def sampled(raw, nominal: bool = False) -> np.ndarray | None:
     """One cell in 64 of the sensor's mosaic as colors: (rows, columns, 3) of red, green and
     blue, shares of the sensor's white with the camera's white balance on, before any
     developing: so the same whichever size is developed afterwards. None for a sensor that
-    is not a mosaic of red, green and blue."""
+    is not a mosaic of red, green and blue. `nominal`: of the white the file names, as Photone
+    develops since 2026-11-26 (adjust_maximum off); else as the decoder did before (below)."""
     pattern, gains = raw.raw_pattern, np.array(raw.camera_whitebalance, float)
     gains[3] = gains[3] or gains[1]
     if pattern is None or pattern.shape != (2, 2) or raw.color_desc != b"RGBG" or gains.min() <= 0:
@@ -90,7 +91,7 @@ def sampled(raw) -> np.ndarray | None:
     # (The decoder takes the highest value in the file for the sensor's white when that is
     # within a quarter of the nominal one: so does this.)
     white = float(mosaic.max())
-    white = white if white > 0.75 * raw.white_level else float(raw.white_level)
+    white = white if white > 0.75 * raw.white_level and not nominal else float(raw.white_level)
     high, wide = mosaic.shape[0] // 2 * 2, mosaic.shape[1] // 2 * 2
     seen = [[], [], []]  # red, green (two to a cell), blue
     for down, across in ((0, 0), (0, 1), (1, 0), (1, 1)):
@@ -117,7 +118,7 @@ def match_of(raw, about: dict | None) -> list[list[float]] | None:
     picture, as Photone shows it at rest with the curve straight, as light as the picture the
     camera put in the file. From `sampled`'s cells and the preview at 640 pixels at most, so
     it is the same whichever size is developed. None where either is missing."""
-    cells = sampled(raw)
+    cells = sampled(raw, nominal=True)
     theirs = carried(raw) if cells is not None and about is not None else None
     if theirs is None:
         return None
@@ -209,42 +210,184 @@ def trimmed(rgb: np.ndarray, sizes, half: bool) -> tuple[np.ndarray, tuple[int, 
     return rgb, (rgb.shape[1] * by, rgb.shape[0] * by)
 
 
-def develop_raw(path: Path, half: bool) -> tuple[dict, np.ndarray]:
-    """Developed no further than demosaicing and the camera's white balance: (h, w, 3) uint16
-    (a photo Photone denoised: (h, w, 4) half floats, as it was written).
+def developed(raw, half: bool) -> np.ndarray:
+    """LibRaw's development as Photone takes it: linear Rec.2020, the camera's white balance,
+    highlights clipped, at the white the file names (adjust_maximum off: LibRaw's default
+    took the photo's brightest value for white when that was above 75 % of it, and so made
+    one photo in six up to 1.29 times brighter, a sensor's white no longer its 1)."""
+    import rawpy
 
-    Half size skips interpolation (one pixel per 2x2 sensor cell): 0.17 s against 0.47 s for a
-    33 MP file, so it is what is shown first."""
+    return raw.postprocess(half_size=half, gamma=(1, 1), no_auto_bright=True, output_bps=16,
+                           use_camera_wb=True, output_color=rawpy.ColorSpace.Rec2020,
+                           highlight_mode=rawpy.HighlightMode.Clip, adjust_maximum_thr=0.0)
+
+
+# LibRaw's own figures (colorconst.cpp; double, D65 float), for `figures`.
+XYZ_RGB = np.array([[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750],
+                    [0.0193339, 0.1191920, 0.9503041]])
+D65 = np.array([0.95047, 1.0, 1.08883], np.float32).astype(float)
+REC2020 = np.array([[0.627452, 0.329249, 0.043299], [0.069109, 0.919531, 0.011360],
+                    [0.016398, 0.088030, 0.895572]])
+F32 = np.float32
+
+
+def _products(left: np.ndarray, rgb_cam: np.ndarray, divide=None) -> np.ndarray:
+    """LibRaw's out[i][j] += float(left[i][k] * rgb_cam[k][j] (/ divide[i])), k = 0..2, in
+    float32 from the left: how its matrices to Rec.2020 and to XYZ for AHD are made."""
+    terms = left[:, :, None] * rgb_cam.astype(float)[None]
+    terms = (terms if divide is None else terms / divide[:, None, None]).astype(F32)
+    return terms[:, 0] + terms[:, 1] + terms[:, 2]
+
+
+def _rgb_cam(cam_xyz) -> np.ndarray | None:
+    """LibRaw's cam_xyz_coeff for three colors: its rows made to sum to 1, inverted. None
+    where the file has no such matrix (all 0s, as LibRaw 0.22 gives a GFX100RF's)."""
+    cam_rgb = np.asarray(cam_xyz, float)[:3] @ XYZ_RGB
+    sums = cam_rgb.sum(axis=1, keepdims=True)
+    cam_rgb = np.where(sums > 0.00001, cam_rgb / np.where(sums > 0.00001, sums, 1), 0)
+    try:
+        return np.linalg.inv(cam_rgb).astype(F32)
+    except np.linalg.LinAlgError:
+        return None
+
+
+def visible(raw, sizes) -> np.ndarray:
+    """The sensor's values LibRaw develops, by its sizes before developing (rawpy's
+    raw_image_visible is cut by the sizes as they are now, and developing changes them)."""
+    return raw.raw_image[sizes.top_margin:sizes.top_margin + sizes.height,
+                         sizes.left_margin:sizes.left_margin + sizes.width]
+
+
+def _cells(mosaic: np.ndarray, cell, black, scale) -> list:
+    """LibRaw's half size of every 8th whole 2 x 2 cell of `mosaic` each way, before its
+    matrix: (red, green, blue), each color's black off, scaled in floats, cut to ints, the two
+    greens' mean."""
+    rows, columns, values = len(mosaic) // 2 * 2, mosaic.shape[1] // 2 * 2, [None] * 4
+    for down, across in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        color = cell[down, across]
+        seen = np.maximum(mosaic[down:rows:16, across:columns:16].astype(np.int64)
+                          - black[color], 0).astype(F32)
+        values[color] = np.clip((seen * scale[color]).astype(np.int32), 0, 65535)
+    return [values[0], (values[1] + values[3]) >> 1, values[2]]
+
+
+def figures(raw, path: Path) -> tuple[dict, np.ndarray | None]:
+    """What the GPU needs to develop this file's mosaic as LibRaw does (ui/develop*.frag, the
+    port of Neuro's libraw.py: black, white balance, AHD, Rec.2020, highlights clipped, turned
+    and cut to the photo), or {} where it can't: not a plain 2 x 2 mosaic of red, green and
+    blue (X-Trans, a Sony's or Canon's small raws, Foveon, a linear DNG), a Panasonic (LibRaw
+    fills its 0s in first), or figures that do not give LibRaw's own picture. That is checked:
+    LibRaw's half-size picture (0.06 s for 33 MP; given back, for the half size, or None if
+    none was made) has no demosaicing, so every 64th of its pixels is worked out from the
+    mosaic here, with each matrix LibRaw may have taken (the file's own, or one made from the
+    matrix from XYZ), and the one that gives them to within 2 (of 65535) is used. Before the
+    file is developed at all: that changes its sizes and colors. ponytail: LibRaw's per-color
+    black only, not the patterns of blacks some files carry; the check sends such a file to
+    the CPU."""
+    import rawpy
+
+    sizes, black = raw.sizes, np.array(raw.black_level_per_channel, np.int64)
+    wide, high = sizes.width, sizes.height
+    pre = np.array(raw.camera_whitebalance, F32)
+    pre[1] = pre[1] or 1
+    pre[3] = pre[3] or pre[1]
+    maximum = int(raw.white_level) - int(black.min())  # (LibRaw takes the common black off it)
+    if (raw.raw_type != rawpy.RawType.Flat or raw.color_desc != b"RGBG" or raw.raw_pattern is None
+            or raw.raw_pattern.shape != (2, 2) or sizes.pixel_aspect != 1 or min(wide, high) < 16
+            or visible(raw, sizes).shape != (high, wide) or path.suffix.lower() == ".rw2"
+            or not pre.min() > 0.00001 or maximum <= 0):
+        return {}, None
+    cell, mosaic = raw.raw_colors_visible[:2, :2].astype(int), visible(raw, sizes)
+    pre = (pre / pre.min()).astype(F32)
+    scale = ((pre * F32(65535)).astype(F32) / F32(maximum)).astype(F32)
+    # LibRaw's picture, as it would be had it not been turned (its `flip`: 4 a quarter turn,
+    # then 2 upside down and 1 left to right), every 8th cell each way.
+    flip, half_rgb = sizes.flip, developed(raw, True)
+    shown = half_rgb.transpose(1, 0, 2) if flip & 4 else half_rgb
+    shown = shown[::-1 if flip & 2 else 1, ::-1 if flip & 1 else 1]
+    if shown.shape[:2] != (-(-high // 2), -(-wide // 2)):
+        return {}, half_rgb
+    theirs = shown[:high // 2:8, :wide // 2:8].astype(int)
+    rgb = _cells(mosaic, cell, black, scale)
+    own = np.asarray(raw.color_matrix, F32)[:3, :3]
+    made = _rgb_cam(raw.rgb_xyz_matrix)
+    mats = ([own] if own[0, 0] > 0.125 else []) + ([made] if made is not None else [])
+    tried = [(m, _products(REC2020, m)) for m in mats]
+    # (a camera LibRaw has no matrix for: its "raw color", its rgb_cam left at 1s, the camera's
+    # colors given as they are)
+    plain = np.eye(3, dtype=F32)
+    for rgb_cam, out_cam in tried + ([(plain, plain)] if made is None else []):
+        ours = np.stack([np.clip((rgb[0] * out_cam[i, 0] + rgb[1] * out_cam[i, 1]
+                                  + rgb[2] * out_cam[i, 2]).astype(np.int32), 0, 65535)
+                         for i in range(3)], axis=-1)
+        if np.abs(ours - theirs).max() <= 2:
+            return {"scale": scale.tolist(), "black": black.tolist(),
+                    "cell": cell.ravel().tolist(), "sensor": [wide, high], "flip": flip,
+                    "xyz_cam": _products(XYZ_RGB, rgb_cam, D65).ravel().tolist(),
+                    "out_cam": out_cam.ravel().tolist()}, half_rgb
+    return {}, half_rgb
+
+
+def _pixels(raw, sizes, path: Path, half: bool, gpu: bool) -> tuple[np.ndarray, dict | None]:
+    """`develop_raw`'s pixels of the open raw file, and for its mosaic what tells the GPU how
+    to develop it (`figures`, and where the photo lies in it), else None. The figures are
+    worked out first, before developing changes the file, if `gpu`."""
+    known = figures(raw, path)[0] if gpu else {}
+    if half or not known:
+        return developed(raw, half), None
+    rows, columns = kept(sizes, False)
+    place = [columns.start, rows.start, columns.stop - columns.start, rows.stop - rows.start]
+    return visible(raw, sizes), {**known, "kept": place}
+
+
+def _denoised(path: Path, half: bool) -> tuple[dict, np.ndarray] | None:
+    """A photo Photone's neural denoiser wrote: no mosaic, and floats, which LibRaw would
+    round. It comes with what the original's camera said (dng.read). None for another file."""
     try:
         ours = dng.read(path, half) if path.suffix.lower() == ".dng" else None
     except (OSError, ValueError) as e:
         raise Unreadable(str(e) if path.name in str(e) else f"{path.name}: {e}") from e
-    if ours:
-        # A photo Photone's neural denoiser wrote: no mosaic, and floats, which LibRaw would
-        # round. It comes with what the original's camera said (dng.read).
-        kept_, pixels = ours
-        info = meta(path.name, pixels.shape[1], pixels.shape[0], kept_["full"])
-        # (Read from a file: what it says is checked as a curve the user sent would be.)
-        match = edit.clean({"curve": kept_["match"]}).get("curve")
-        info.update(raw=True, camera=kept_["camera"], match=match, denoised=True)
-        return info, pixels
+    if not ours:
+        return None
+    kept_, pixels = ours
+    info = meta(path.name, pixels.shape[1], pixels.shape[0], kept_["full"])
+    # (Read from a file: what it says is checked as a curve the user sent would be.)
+    match = edit.clean({"curve": kept_["match"]}).get("curve")
+    info.update(raw=True, camera=kept_["camera"], match=match, denoised=True)
+    return info, pixels
+
+
+def develop_raw(path: Path, half: bool, mosaic: bool = True) -> tuple[dict, np.ndarray]:
+    """Developed no further than demosaicing and the camera's white balance: (h, w, 3) uint16
+    (a photo Photone denoised: (h, w, 4) half floats, as it was written). The full size of a
+    file the GPU can develop (`figures`) is not developed here: it is the sensor's mosaic,
+    (h, w) uint16, and info["mosaic"] says how (ui/Develop.qml); 0.35 s of a Sony's 0.6 s
+    saved, and 48 MB sent where 264 were. `mosaic` False: developed here all the same.
+
+    Half size skips interpolation (one pixel per 2x2 sensor cell): 0.17 s against 0.47 s for a
+    33 MP file, so it is what is shown first."""
+    if ours := _denoised(path, half):
+        return ours
     import rawpy  # slow to import, and the checks run without a raw file
 
     try:
-        with rawpy.imread(str(path)) as raw:
-            sizes = raw.sizes  # before developing, which changes them
-            about = camera(raw.camera_whitebalance, raw.rgb_xyz_matrix)
-            match = match_of(raw, about)
-            rgb = raw.postprocess(
-                half_size=half, gamma=(1, 1), no_auto_bright=True, output_bps=16,
-                use_camera_wb=True, output_color=rawpy.ColorSpace.Rec2020,
-                highlight_mode=rawpy.HighlightMode.Clip)
+        # (Not `with`: the mosaic is a view of the file's memory, which it keeps open.)
+        raw = rawpy.imread(str(path))
+        sizes = raw.sizes  # before developing, which changes them
+        about = camera(raw.camera_whitebalance, raw.rgb_xyz_matrix)
+        match = match_of(raw, about)
+        rgb, gpu = _pixels(raw, sizes, path, half, mosaic and not half)
+        del raw
     except rawpy.LibRawFileUnsupportedError as e:  # (its message is a bytes object's repr)
         raise Unreadable(f"{path.name}: Photone cannot read this kind of raw file yet") from e
     except (rawpy.LibRawError, OSError) as e:
         raise Unreadable(f"{path.name}: {e}") from e
-    rgb, full = trimmed(rgb, sizes, half)
-    info = meta(path.name, rgb.shape[1], rgb.shape[0], full)
+    if gpu:  # the mosaic: the GPU turns it and cuts it to the photo
+        info = meta(path.name, *gpu["kept"][2:])
+        info["mosaic"] = gpu
+    else:
+        rgb, full = trimmed(rgb, sizes, half)
+        info = meta(path.name, rgb.shape[1], rgb.shape[0], full)
     # (With the camera's figures for the lens that was on it, where the file has them:
     # they travel with what is known of the camera, to wherever the shader's numbers are made.
     # None where the file gives no usable matrix: many DNGs, whose LibRaw leaves it zero.)
@@ -271,10 +414,10 @@ def develop_raster(path: Path) -> tuple[dict, np.ndarray]:
     return meta(path.name, image.width(), image.height()), pixels.copy()  # `image` ends here
 
 
-def develop(path: Path, half: bool) -> tuple[dict, np.ndarray]:
+def develop(path: Path, half: bool, mosaic: bool = True) -> tuple[dict, np.ndarray]:
     kind = path.suffix.lower()
     if kind in RAW:
-        return develop_raw(path, half)
+        return develop_raw(path, half, mosaic)
     if kind in RASTER:
         return develop_raster(path)
     raise Unreadable(f"{path.name}: not a kind of photo Photone can open")
@@ -282,6 +425,23 @@ def develop(path: Path, half: bool) -> tuple[dict, np.ndarray]:
 
 HALF = (np.arange(65536) / 65535).astype(np.float16)  # a 16-bit integer as a half float
 BANDS = min(8, os.cpu_count() or 1)
+
+
+def texels(info: dict) -> tuple[int, int, str]:
+    """(columns, rows, QImage format) of the picture `store` writes: RGBA half floats, or a
+    raw file's mosaic two sensor values to a texel, each as its low and its high byte
+    (Develop.qml reads them; "premultiplied" so that Qt sends the bytes as they are: as
+    plain RGBA it multiplied them by the "alpha", and as 16-bit gray it made them 8-bit)."""
+    if "mosaic" in info:
+        wide, high = info["mosaic"]["sensor"]
+        return -(-wide // 2), high, "Format_RGBA8888_Premultiplied"
+    return info["width"], info["height"], "Format_RGBA16FPx4"
+
+
+def size_of(info: dict) -> int:
+    """The bytes of the picture `store` writes."""
+    columns, rows, _ = texels(info)
+    return columns * rows * (4 if "mosaic" in info else 8)
 
 
 def store(pixels: np.ndarray, buf) -> None:
@@ -292,6 +452,11 @@ def store(pixels: np.ndarray, buf) -> None:
     In one pass, straight to where they are wanted, in bands on threads (numpy lets other
     threads run meanwhile): 0.04 s for 33 MP. (Before 2026-11-17 it was four passes, 0.2 s:
     integers into four channels, Qt making them floats, a copy into shared memory.)"""
+    if pixels.ndim == 2:  # a mosaic: its 16-bit values as they are, an even number to a row
+        out = np.ndarray((len(pixels), -(-pixels.shape[1] // 2) * 2), np.uint16, buffer=buf)
+        out[:, :pixels.shape[1]] = pixels
+        out[:, pixels.shape[1]:] = 0
+        return
     out = np.ndarray((*pixels.shape[:2], 4), np.float16, buffer=buf)
     if pixels.shape[2] == 4:
         out[...] = pixels
@@ -306,21 +471,21 @@ def store(pixels: np.ndarray, buf) -> None:
         list(bands.map(band, range(BANDS)))
 
 
-def load(path: Path, half: bool = True) -> tuple[dict, Pixels]:
+def load(path: Path, half: bool = True, mosaic: bool = False) -> tuple[dict, Pixels]:
     """In this process. The checks use it; the app goes through Workers."""
-    info, pixels = develop(path, half)
-    buf = bytearray(info["width"] * info["height"] * 8)
+    info, pixels = develop(path, half, mosaic=mosaic)
+    buf = bytearray(size_of(info))
     store(pixels, buf)
     return info, Pixels(buf)
 
 
-def load_shared(path: Path, half: bool) -> tuple[dict, str]:
+def load_shared(path: Path, half: bool, mosaic: bool = True) -> tuple[dict, str]:
     """In the worker: the pixels go into shared memory, and only its name travels back (that
     is all of a SharedMemory that is sent; the program has it open as soon as the answer
-    arrives). (Through a pipe, 264 MB of them took a quarter of a second.)"""
-    info, pixels = develop(path, half)
-    w, h = info["width"], info["height"]
-    shared = SharedMemory(create=True, size=w * h * 8)
+    arrives). (Through a pipe, 264 MB of them took a quarter of a second.) `mosaic` False: a raw
+    file's full size developed here, never left to the GPU."""
+    info, pixels = develop(path, half, mosaic)
+    shared = SharedMemory(create=True, size=size_of(info))
     store(pixels, shared.buf)
     if sys.platform == "win32":
         # Windows drops the memory when nobody has it open: held until the program surely has.
@@ -397,20 +562,24 @@ class Workers:
         if not future.cancel():
             future.add_done_callback(free)
 
-    def load(self, path: Path, half: bool = True) -> tuple[dict, Pixels]:
+    def load(self, path: Path, half: bool = True, mosaic: bool = True) -> tuple[dict, Pixels]:
         # (May be called from two threads at once.) Decoded ahead, or being so: that one. Still
         # waiting its turn there: not that one, the workers for what is asked for are free.
+        # `mosaic` False: as `load_shared`'s (not one decoded ahead, which may be a mosaic).
         early = self.early.pop((path, half), None) or self.before.pop((path, half), None)
-        if early and early.cancel():
+        if early and not mosaic:
+            self._give_up(early)
+            early = None
+        elif early and early.cancel():
             early = None
         try:
-            info, shared = early.result() if early else self.call(load_shared, path, half)
+            info, shared = early.result() if early else self.call(load_shared, path, half, mosaic)
         except BrokenProcessPool:
             self.pool = self._start()
             raise Unreadable(f"{path.name}: the decoder crashed on this file") from None
         except Unreadable as e:
             raise Unreadable(str(e) if path.name in str(e) else f"{path.name}: {e}") from None
-        size = info["width"] * info["height"] * 8  # (Windows hands out whole pages: cut to this)
+        size = size_of(info)  # (Windows hands out whole pages: cut to this)
         return info, Pixels(shared.buf if len(shared.buf) == size else shared.buf[:size], shared)
 
     def close(self) -> None:

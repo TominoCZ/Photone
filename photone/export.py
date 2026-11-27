@@ -503,9 +503,11 @@ class Exporter(QObject):
         except (decode.Unreadable, OSError) as e:
             return self.decoded.emit((run, str(e) or f"{photo.name} could not be read"))
         try:
-            wide, high = meta["width"], meta["height"]
-            # Its own copy of the pixels, before they are given back.
-            image = QImage(pixels.buf, wide, high, wide * 8, QImage.Format.Format_RGBA16FPx4).copy()
+            # Its own copy of the pixels, before they are given back. (A raw file's mosaic, as
+            # a rule: the bench develops it as the photo on screen is, Develop.qml.)
+            wide, high, kind = decode.texels(meta)
+            image = QImage(pixels.buf, wide, high, decode.size_of(meta) // high,
+                           getattr(QImage.Format, kind)).copy()
         finally:
             pixels.close()
         self.decoded.emit((run, (meta, image)))
@@ -554,7 +556,7 @@ class Exporter(QObject):
                      "lut": f"image://photo/lut/{lut.address(tables)}/export" if tables else "",
                      # (A look's table: each color of it read by itself, not mixed with its
                      # neighbor's as a photo's pixels are, however little.)
-                     "exact": self._table is not None,
+                     "exact": self._table is not None, "mosaic": meta.get("mosaic"),
                      "tiles": tiles(wide, high, deep, self.side, len(inside))}
         self.changed.emit()
 

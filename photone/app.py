@@ -89,12 +89,27 @@ def small_copy(meta: dict, buf) -> np.ndarray:
     return seen[::step, ::step, :3].astype(np.float32)
 
 
-def owned(buf, width: int, height: int) -> QImage:
+def unlike(seen: np.ndarray, small: np.ndarray) -> float:
+    """The share of `seen`'s points (h, w, 3: the GPU's development of a raw file, linear,
+    0..1, as bytes, one full-size pixel each, at about the places between small[:h + 1,
+    :w + 1]'s) that match none of the four points of `small` around them (`small_copy` of
+    LibRaw's half size: no demosaicing, so the four absorb the half step between the two, and
+    an edge). About 0 for the same development; a channel missing, or every other pixel, is
+    most of them."""
+    high, wide = seen.shape[:2]
+    off = np.inf
+    for near in (small[a:a + high, b:b + wide] for a in (0, 1) for b in (0, 1)):
+        each = np.abs(near - seen) - 0.25 * near  # (and an edge)
+        off = np.minimum(off, np.maximum(np.maximum(each[..., 0], each[..., 1]), each[..., 2]))
+    return float((off > 3 / 255).mean())  # (and the bytes' step)
+
+
+def owned(buf, width: int, height: int, kind: str = "Format_RGBA16FPx4") -> QImage:
     """A float image that owns its pixels, copied out of `buf`. By numpy and not by Qt's own
     `copy`: that keeps Python's lock while it runs (50 ms for 33 MP), and the interface, which
     asks Python at every turn, stood still at every photo opened; numpy lets go of it."""
-    image = QImage(width, height, QImage.Format.Format_RGBA16FPx4)
-    size = width * height * 8
+    image = QImage(width, height, getattr(QImage.Format, kind))
+    size = image.sizeInBytes()
     to, of = np.frombuffer(image.bits(), np.uint8, size), np.frombuffer(buf, np.uint8, size)
 
     def part(k: int) -> None:  # a quarter of it (15 ms for 33 MP on four threads, 42 on one)
@@ -803,7 +818,12 @@ class Session(QObject):
         when it has been decoded ahead, must not hold up the one that is shown first."""
         raw = self.photos and self.photos[self._index].suffix.lower() in decode.RAW
         seen = self._seen == self._generation
-        return self._address("full") if raw and seen and not self._panels["chart"] else ""
+        return self._address(self._full()) if raw and seen and not self._panels["chart"] else ""
+
+    def _full(self) -> str:
+        """The size the open photo's full size is asked for at: "cpu" if the GPU developed it
+        wrong (`checkDeveloped`)."""
+        return "cpu" if self.photos[self._index] in self.cpu else "full"
 
     @Property("QStringList", notify=heldChanged)
     def held(self) -> list:
@@ -1041,10 +1061,11 @@ class Session(QObject):
             wait([first] if first else [])
             if generation != open_now[0]:
                 raise decode.Unreadable("left before it was decoded")
-            return load(path, False)
+            return load(path, False, mosaic=False) if cpu else load(path, False)
 
+        cpu = path in self.cpu
         if path.suffix.lower() in decode.RAW and not self.recent.has(path, False):
-            address = self._address("full").removeprefix("image://photo/")
+            address = self._address(self._full()).removeprefix("image://photo/")
             self.fetching[address] = self.threads.submit(then_full)
         self.reader.start()
 
@@ -1063,6 +1084,46 @@ class Session(QObject):
                 if 0 <= at < len(self.photos) and not self.recent.has(self.photos[at], half)]
 
     BLANK = (1, 1)  # what a photo that cannot be shown comes back as: see `failed`
+    mosaics: dict = {}  # of the full-size pictures handed out last, by address: decode's "mosaic"
+    cpu: frozenset = frozenset()  # the raw files the GPU developed wrong: their full size is a
+    # picture developed by LibRaw, at the address of size "cpu" (`checkDeveloped`)
+    grabbing = None  # the GPU's development being read back for `checkDeveloped`
+
+    @Slot(QObject, str)
+    def checkDeveloped(self, item, source: str) -> None:  # noqa: N802 - read from QML
+        """Read back a few of the pixels of a raw file's full size as the GPU developed it
+        (Develop.qml, its last pass drawn again at about 250 across: one full-size pixel each,
+        none averaged) and compare them to LibRaw's half size; where they differ, that file's
+        full size is developed by LibRaw from now on. Figures that agree with LibRaw
+        (decode.figures) do not make a picture that does: the GPU may read them otherwise.
+        (Measured: 2 to 5 ms on the interface's thread for the comparison, once a photo.)"""
+        listing, index, _ = source.removeprefix("image://photo/").split("/")
+        path = self.photos[int(index)] if listing == str(self._listing) else None
+        kept = self.recent.get(path, True) if path else None
+        if kept is None or kept[2] is None or min(kept[2].shape[:2]) < 6:
+            return
+        small = kept[2][::2, ::2]  # (some 250 across)
+        grab = self.grabbing = item.grabToImage(QSize(small.shape[1] - 1, small.shape[0] - 1))
+
+        def judge() -> None:
+            self.grabbing = None
+            seen = grab.image().convertToFormat(QImage.Format.Format_RGBX8888)
+            pixels = np.frombuffer(seen.constBits(), np.uint8).reshape(seen.height(), -1)
+            share = unlike(pixels[:, :seen.width() * 4].reshape(seen.height(), -1, 4)[..., :3]
+                           / np.float32(255), small)
+            if share > 0.2 and path not in self.cpu:
+                print(f"photone: {path.name}: the GPU's development is not LibRaw's ({share:.0%}"
+                      " of the points differ): developed by LibRaw", file=sys.stderr)
+                self.cpu = self.cpu | {path}
+                self.changed.emit()
+
+        grab.ready.connect(judge)
+
+    @Slot(str, result="QVariant")
+    def mosaicOf(self, source: str):  # noqa: N802 - read from QML
+        """How to develop the picture at that address (decode.figures, and where the photo
+        lies in it), if it is a raw file's mosaic; else None (it is the picture itself)."""
+        return self.mosaics.get(source.removeprefix("image://photo/"))
 
     def image(self, address: str) -> QImage:
         """The photo as a float image. Runs on Qt's image loader thread."""
@@ -1080,7 +1141,7 @@ class Session(QObject):
             meta, pixels = decode.synthetic(*CHART)
             return QImage(pixels.buf, *CHART, CHART[0] * 8, QImage.Format.Format_RGBA16FPx4).copy()
         try:
-            meta, picture, small = self._picture(address, self.photos[int(index)], size != "full")
+            meta, picture, small = self._picture(address, self.photos[int(index)], size == "half")
         except CancelledError:
             return blank  # left while this was being asked for
         except Exception as e:  # noqa: BLE001 - raised here, Qt drops it: a blank view, no word
@@ -1123,15 +1184,19 @@ class Session(QObject):
         """(what the decoder says of the photo, its picture, its thinned copy for the quick
         size): as kept from when it was last open, or decoded now and kept."""
         kept = self.recent.get(path, half)
-        if kept is None:
+        cpu = not half and path in self.cpu
+        if kept is None or cpu and "mosaic" in kept[0]:
             wanted = self.fetching.pop(address, None)
-            meta, pixels = wanted.result() if wanted else self.load(path, half)
+            meta, pixels = (wanted.result() if wanted else self.load(path, half, mosaic=False)
+                            if cpu else self.load(path, half))
             try:
-                kept = (meta, owned(pixels.buf, meta["width"], meta["height"]),
+                kept = (meta, owned(pixels.buf, *decode.texels(meta)),
                         small_copy(meta, pixels.buf) if half else None)
             finally:
                 pixels.close()
             self.recent.put(path, half, kept)
+        if not half:  # (before Qt has the picture: Develop.qml asks when it is there)
+            self.mosaics = {**dict(list(self.mosaics.items())[-7:]), address: kept[0].get("mosaic")}
         return kept
 
     def _described(self, generation: int, meta: dict) -> None:
@@ -2092,7 +2157,10 @@ def make_view(session: Session, library: Library | None = None,
                        ("barsShader", "bars.frag"), ("barsVertex", "bars.vert"),
                        ("brushShader", "brush.frag"), ("brushVertex", "brush.vert"),
                        ("brushedShader", "brushed.frag"), ("brushedVertex", "brushed.vert"),
-                       ("mixingShader", "mixing.frag"), ("mixingVertex", "mixing.vert")):
+                       ("mixingShader", "mixing.frag"), ("mixingVertex", "mixing.vert"),
+                       ("developShader", "develop.frag"), ("developVertex", "develop.vert"),
+                       ("developGreenShader", "develop_green.frag"),
+                       ("developHomoShader", "develop_homo.frag")):
         url = QUrl.fromLocalFile(str(shaders.compiled(file)))
         context.setContextProperty(name, url.toString())
     view.setSource(QUrl.fromLocalFile(str(UI / "Main.qml")))

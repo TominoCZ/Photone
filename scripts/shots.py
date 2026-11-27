@@ -250,9 +250,10 @@ def neural(root, session, state: str, share: float = 1.0, step: str = "Denoising
 SAMPLE = Path(os.environ.get("PHOTONE_SAMPLE", "/data/projects/Neuro/samples/IMG01184.ARW"))
 
 
-def told(kind: str, why: str = ""):
+def told(kind: str, why: str = "", listed: bool = False):
     """A shot of the Neural Denoise window, ready, on SAMPLE, saying which net ran (Denoise.qml's
-    `which`): `kind` "sensor" or "developed", and `why`."""
+    Model, and its line of why not the sensor's): `kind` "sensor" or "developed", and `why`;
+    `listed`, with the list of models open."""
     def make() -> ui.Session:
         return ui.Session([SAMPLE]) if SAMPLE.is_file() else photo()
 
@@ -271,6 +272,7 @@ def told(kind: str, why: str = ""):
         denoiser._set("ready", "", 1.0)
         find(root, "denoise-window").setProperty("visible", True)
         find(root, "denoise-cancel").forceActiveFocus()
+        find(root, "modal:denoise-models").parentItem().setProperty("visible", listed)
     return make, after
 
 
@@ -615,6 +617,8 @@ SHOTS = {
     "denoise-sensor": (BIG, *told("sensor")),
     "denoise-older": (BIG, *told("developed", "pattern")),
     "denoise-missing": (BIG, *told("developed", "missing")),
+    "denoise-models": (BIG, *told("sensor", listed=True)),
+    "denoise-unfit": (BIG, *told("developed", "pattern", listed=True)),
     "lens": (BIG, lambda: ui.Session([Path("test chart.arw")], load=lensed), lambda root, session: (
         session.setEdit("lensColor", False), show(root, "lens"))),
     "lens-none": (SMALL, photo, lambda root, session: show(root, "lens")),
@@ -1102,6 +1106,103 @@ def audit_modal(view, root) -> list[str]:
     if not no.hasActiveFocus():
         return ["with a question open, the left arrow does not go back to Cancel"]
     return []
+
+
+def audit_denoise_model() -> list[str]:
+    """Neural Denoise's Model, with real clicks and keys, the net stood in for: the list opens
+    under its button and Escape closes it alone; picking the other model runs the photo through
+    it and is kept as what is asked for; on a photo the sensor's model can't take, the other
+    runs, the sensor's entry does nothing, a line says why, and what is asked for stays."""
+    import threading
+    import time
+
+    from photone import denoise
+
+    session = ui.Session([Path("first.arw")], load=chart)
+    view, root = opened(session)
+    neural(root, session, "ready")
+    settle()
+    denoiser, window = session.denoiser, find(root, "denoise-window")
+    noisy, about, real, photo_fits = denoiser.held.noisy, denoiser.held.about, denoise.run, [True]
+
+    def stand_in(path, progress=None, stopped=None, step=None, want="sensor"):
+        held = denoise.Denoised(noisy, about)
+        found = {"sensor": Path("sensor.onnx"), "developed": Path("developed.onnx")}
+        held.kind, held.why, held.model = denoise.chosen({"sensed": {}} if photo_fits[0] else {"why": "pattern"}, found, want)
+        held.clean[...], held.where = held.into(noisy), "CUDA"
+        return held
+
+    def ran(kind: str) -> bool:
+        for _ in range(200):
+            settle()
+            if denoiser.state == "ready" and denoiser.kind:
+                break
+        return denoiser.kind == kind
+
+    def listed() -> bool:
+        return find(root, "modal:denoise-models").parentItem().isVisible()
+
+    faults, expect = [], lambda what, fault: None if what else faults.append(fault)
+    denoise.run = stand_in
+    try:
+        expect(window.property("model") == "sensor", f"the sensor's model is not the one asked for at first: {window.property('model')}")
+        click(view, find(root, "denoise-model"))
+        expect(listed(), "a click on Model does not open its list")
+        QTest.keyClick(view, Qt.Key.Key_Escape)
+        settle()
+        expect(not listed() and window.isVisible(), "Escape with the list open does not close the list alone")
+        click(view, find(root, "denoise-model"))
+        click(view, find(root, "denoise-model-developed"))
+        expect(not listed() and ran("developed") and denoiser.why == "asked", f"picking Developed data did not run it: {denoiser.kind}, {denoiser.why}")
+        expect(window.property("model") == "developed", "the model picked is not the one asked for from then on")
+        expect(not find(root, "denoise-which").isVisible(), "a line of why not, where the user picked the other model")
+        click(view, find(root, "denoise-model"))
+        click(view, find(root, "denoise-model-sensor"))
+        expect(ran("sensor") and window.property("model") == "sensor", f"picking Sensor data did not run it: {denoiser.kind}")
+        # Picked while a run is under way: that run is stopped, and the new one is the result.
+        waiting, stopped_runs = threading.Event(), []
+
+        def slow(path, progress=None, stopped=None, step=None, want="sensor"):
+            if want == "sensor":  # (as the net's pieces do: it goes on until it is told to stop)
+                waiting.set()
+                for _ in range(2000):
+                    if stopped():
+                        stopped_runs.append(want)
+                        raise denoise.Stopped
+                    time.sleep(0.005)
+            return stand_in(path, want=want)
+
+        denoise.run = slow
+        denoiser.start(str(session.photos[0]), "sensor")
+        waiting.wait(5)
+        settle()
+        expect(denoiser.state == "working", f"a run under way is not working: {denoiser.state}")
+        click(view, find(root, "denoise-model"))
+        click(view, find(root, "denoise-model-developed"))
+        done = ran("developed")
+        for _ in range(200):  # (the stopped run's thread says so within its next look)
+            if stopped_runs:
+                break
+            time.sleep(0.005)
+        expect(done and stopped_runs == ["sensor"], f"a pick during a run did not stop it and run the other: {denoiser.kind}, stopped {stopped_runs}")
+        denoise.run = stand_in
+        click(view, find(root, "denoise-model"))
+        click(view, find(root, "denoise-model-sensor"))
+        expect(ran("sensor"), "back to Sensor data after a stopped run")
+        # A photo the sensor's model can't take: the other one, and the entry does nothing.
+        photo_fits[0] = False
+        denoiser.start(str(session.photos[0]), "sensor")
+        expect(ran("developed") and denoiser.why == "pattern", f"a sensor it can't take did not fall back: {denoiser.kind}, {denoiser.why}")
+        expect(find(root, "denoise-which").isVisible(), "nothing says why the sensor's model did not run")
+        click(view, find(root, "denoise-model"))
+        before = denoiser._run
+        click(view, find(root, "denoise-model-sensor"))
+        expect(denoiser._run == before and listed(), "the sensor's entry acts on a photo it can't take")
+        expect(window.property("model") == "sensor", "falling back changed what is asked for")
+    finally:
+        denoise.run = real
+        denoiser.close()
+    return faults
 
 
 def audit_checkpoints() -> list[str]:
@@ -5446,7 +5547,8 @@ AUDITS = {"(keys)": audit_stepping, "(held)": audit_held, "(dock)": audit_dock, 
           "(test chart)": audit_test_chart, "(library)": audit_library, "(export)": audit_export,
           "(frame)": audit_frame, "(crop)": audit_crop, "(slider)": audit_slider, "(tools)": audit_tools,
           "(curve)": audit_curve, "(balance)": audit_balance, "(start)": audit_start, "(tone)": audit_tone, "(scopes)": audit_scopes,
-          "(precision)": audit_precision, "(checkpoints)": audit_checkpoints}
+          "(precision)": audit_precision, "(checkpoints)": audit_checkpoints,
+          "(denoise-model)": audit_denoise_model}
 
 
 def chosen(args: list[str]) -> tuple[list[str], list[str], str]:

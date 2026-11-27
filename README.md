@@ -56,10 +56,11 @@ Your originals are never touched. Edits live in Photone's own catalog
 
 ## Neural Denoise
 
-Photone ships its own neural denoiser: a network of 4 million weights (NAFNet), trained for
-Photone. It sees the photo as the sensor recorded it, in the camera's own colors and before
-any edit, so what it removes is the sensor's noise rather than detail an edit has brightened
-or sharpened.
+Photone ships its own neural denoiser: two networks of 4 million weights each (NAFNet),
+trained for Photone. Either sees the photo as the sensor recorded it, in the camera's own
+colors and before any edit, so what it removes is the sensor's noise rather than detail an
+edit has brightened or sharpened. The **Sensor data** model takes the sensor's mosaic itself
+and demosaics as it denoises; the **Developed data** model takes the photo after demosaicing.
 
 ![The same piece of a photo at 100 %, before and after Neural Denoise](docs/images/denoise-compare.png)
 
@@ -71,15 +72,16 @@ on the processor if no GPU is available. A 33-megapixel photo takes about 11 sec
 RTX 3080 Ti. While the result is on screen, you can:
 
 - zoom and pan it as in Edit, and hold **A/B** to see the original;
-- choose how much of the **color noise** and of the **grain** stays removed, without running
-  the net again.
+- choose how much of the **grain** stays removed, without running the net again;
+- pick the other **Model**, which runs the photo through it.
 
 **Accept** writes `<name>-Denoised.dng` beside the original, with the photo's edit copied to
 it. It is shown straight after the original in the library. The original is not changed.
 
 ![The Neural Denoise window](docs/images/denoise.png)
 
-It takes raw files from cameras with a standard 2×2 color mosaic (not Fujifilm X-Trans). For
+The Sensor data model is the default. It takes raw files from cameras with a standard 2×2
+color mosaic; other photos (Fujifilm X-Trans, say) go through the Developed data model. For
 the cameras whose sensor noise has been measured, the denoiser uses those figures; for any
 other camera it estimates the noise from the photo itself.
 
@@ -93,7 +95,6 @@ cd Photone
 ./run.sh                # start in the library
 ./run.sh photo.ARW      # or open a photo directly
 ./run.sh --hdr          # start in HDR, where the desktop has it
-./run.sh --raw-denoise  # let Neural Denoise use the experimental raw net, if one is installed
 ```
 
 The first run downloads Python, Qt and the other packages. System packages are listed in

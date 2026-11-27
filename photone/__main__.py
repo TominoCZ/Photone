@@ -2,7 +2,6 @@
 
     photone [photo ...]          open the window, on these photos
     photone --hdr [photo ...]    with the SDR | HDR switch on HDR (it is remembered otherwise)
-    photone --raw-denoise        Neural Denoise may use the raw net, where one is installed
 """
 
 from __future__ import annotations
@@ -33,16 +32,11 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="photone", description="A raw photo editor.")
     parser.add_argument("photos", nargs="*", type=Path, help="photos to open")
     parser.add_argument("--hdr", action="store_true", help="start with the switch on HDR")
-    parser.add_argument("--raw-denoise", action="store_true",
-                        help="let Neural Denoise use the raw net, where one is installed")
     args = parser.parse_args()
     missing = [str(p) for p in args.photos if not p.is_file()]
     if missing:
         sys.exit(f"photone: no such file: {', '.join(missing)}")
     args.photos = [p.resolve() for p in args.photos]
-    from photone import denoise
-
-    denoise.RAW_NET = args.raw_denoise
     return args
 
 

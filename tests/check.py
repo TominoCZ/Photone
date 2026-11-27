@@ -2945,6 +2945,10 @@ def check_denoise_kinds() -> None:
         assert denoise.chosen(sensed, found) == ("sensor", "", found["sensor"])
         assert denoise.chosen({"why": "pattern"}, found) == ("developed", "pattern", found["developed"]), "X-Trans: the older net"
         assert denoise.chosen({}, {**found, "sensor": None}) == ("developed", "missing", found["developed"]), "no raw net installed"
+        assert denoise.chosen(sensed, found, "developed") == ("developed", "asked", found["developed"]), "the older net, asked for"
+        assert denoise.chosen({"why": "pattern"}, found, "developed")[1] == "pattern", "asked for or not, the raw net could not have run"
+        shipped = denoise.models()
+        assert shipped["sensor"] and shipped["developed"], f"both nets ship with Photone: {shipped}"
         held = {"sensed": {"mosaic_size": (40, 60)}}
         denoise._fit(held, (40, 61, 3), types.SimpleNamespace(flip=0))
         assert held == {"why": "layout"}, "LibRaw's picture not the sensor's size: the older net"
@@ -3070,10 +3074,10 @@ def _mosaic_dng(path: Path, mosaic: np.ndarray, flip: int = 1) -> Path:
 
 
 def check_denoise_brightness() -> None:
-    """A photo whose brightest value is between 75 % and 100 % of its white: LibRaw (rawpy's
-    adjust_maximum_thr, 0.75 unless told) takes that value for white, so the picture Photone
-    shows is brighter by white / brightest. The older net is given the photo as bright as Neuro
-    trained it (developed at 0: the sensor's white), and its result is as bright as shown."""
+    """A photo whose brightest value is between 75 % and 100 % of its white: LibRaw's default
+    (adjust_maximum_thr 0.75) would take that value for white and show it brighter. Photone
+    develops at the sensor's white (decode.developed), as Neuro trained the older net, so the
+    net is given the photo as it is shown, and its result is as bright as shown."""
     import rawpy
 
     # A gray scene, lighter to the right, its brightest green 86 % of white; red and blue a
@@ -3083,22 +3087,91 @@ def check_denoise_brightness() -> None:
     light[0::2, 0::2] *= 0.98 / 1.6  # (blue first: blue, green / green, red)
     light[1::2, 1::2] *= 0.98 / 2.4
     mosaic = (512 + light).astype("<u2")
-    figures = {"half_size": False, "gamma": (1, 1), "no_auto_bright": True, "output_bps": 16, "use_camera_wb": True,
-               "output_color": rawpy.ColorSpace.Rec2020, "highlight_mode": rawpy.HighlightMode.Clip}
     with tempfile.TemporaryDirectory() as folder:
         path = _mosaic_dng(Path(folder) / "bright.dng", mosaic)
         noisy, about = denoise.develop(path)
         with rawpy.imread(str(path)) as raw:
-            kept = decode.kept(raw.sizes, False)
-            shown, trained = raw.postprocess(**figures)[kept], raw.postprocess(adjust_maximum_thr=0.0, **figures)[kept]
-    assert (noisy == shown).all() and about["room"] == mosaic.max() - 512, ("the picture shown changed", about["room"])
+            shown = decode.developed(raw, False)[decode.kept(raw.sizes, False)]
+    assert (noisy == shown).all() and about["room"] == 16000 - 512, ("the picture shown changed", about["room"])
     held = denoise.Denoised(noisy, about)
-    v, norm = denoise._terms(held)
-    v0, norm0 = denoise._terms(denoise.Denoised(trained, {**about, "room": 15488.0}))
-    off = np.abs(v - v0)
-    assert np.median(off) < 0.01 and np.percentile(off, 99) < 0.1 and abs(norm / norm0 - 1) < 1e-3, ("the net given the photo brighter than it was trained on", np.median(off), norm, norm0)
-    held.clean[...] = v  # (a net that gives back what it is given)
+    held.clean[...] = denoise._terms(held)[0]  # (a net that gives back what it is given)
     assert np.allclose(held.picture()[..., :3], shown / 65535, rtol=2e-3, atol=1e-4), "the net's result not as bright as the photo shown"
+
+
+def check_develop_on_gpu() -> None:
+    """A raw file's full size developed by the GPU (ui/Develop.qml) is LibRaw's picture: a
+    sensor of blue first, cut and turned a quarter, fine stripes at every angle (where AHD
+    picks its way) and a ramp. Read back in 8 bits, off screen, in a process of its own. The
+    mosaic comes as in the program, after frames drawn without it (Qt fetches it on a thread):
+    the passes once read none of each other's pictures then, and the photo had no green
+    (magenta). And Session.checkDeveloped's comparison tells such a picture from LibRaw's."""
+    y, x = np.mgrid[0:100, 0:150]
+    stripes = np.sin(0.9 * x + 0.5 * y * (y > 50)) * np.cos(0.04 * x * y / 10)
+    mosaic = (512 + 3000 + 5000 * (x / 149) + 2500 * stripes).astype("<u2")
+    with tempfile.TemporaryDirectory() as folder:
+        path = _mosaic_dng(Path(folder) / "turned.dng", mosaic, flip=6)
+        done = subprocess.run([sys.executable, __file__, "--develop-on-gpu", str(path)], capture_output=True,
+                              text=True, timeout=120, check=False, env={**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_QUICK_BACKEND": "rhi"})
+        assert done.returncode == 0 and done.stdout.startswith("ok"), done.stdout + done.stderr[-800:]
+
+
+def develop_on_gpu(path: Path) -> None:
+    """check_develop_on_gpu's own process: says "ok" or what is off."""
+    import rawpy
+    from PySide6.QtGui import QGuiApplication, QSurfaceFormat
+    from PySide6.QtQml import QQmlImageProviderBase
+    from PySide6.QtQuick import QQuickImageProvider, QQuickView
+
+    modern = QSurfaceFormat()
+    modern.setVersion(4, 5), modern.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    QSurfaceFormat.setDefaultFormat(modern)
+    application = QGuiApplication(sys.argv[:1])  # noqa: F841 - must outlive the view
+    info, pixels = decode.load(path, False, mosaic=True)
+    assert "mosaic" in info, "the GPU does not develop this file"
+    wide, high, kind = decode.texels(info)
+    image = QImage(bytes(pixels.buf), wide, high, len(pixels.buf) // high, getattr(QImage.Format, kind))
+
+    class Provider(QQuickImageProvider):
+        def requestImage(self, name, size, requested):  # noqa: N802
+            time.sleep(0.5)  # (on Qt's thread for it: frames are drawn meanwhile)
+            size.setWidth(image.width()), size.setHeight(image.height())
+            return image
+
+    view = QQuickView()
+    view.engine().addImageProvider("m", Provider(QQmlImageProviderBase.ImageType.Image))
+    for name, file in (("developShader", "develop.frag"), ("developVertex", "develop.vert"),
+                       ("developGreenShader", "develop_green.frag"), ("developHomoShader", "develop_homo.frag")):
+        view.rootContext().setContextProperty(name, QUrl.fromLocalFile(str(shaders.compiled(file))).toString())
+    view.rootContext().setContextProperty("given", info["mosaic"])
+    w, h = info["width"], info["height"]
+    with tempfile.TemporaryDirectory() as folder:
+        (Path(folder) / "develop.qml").write_text(
+            f'import QtQuick\nimport "{app.UI.as_uri()}"\nItem {{ width: {w}; height: {h}\n'
+            'property bool there: m.status === Image.Ready\n'
+            'Image { id: m; source: "image://m/x"; smooth: false; visible: false; asynchronous: true }\n'
+            'Develop { id: d; mosaic: m; figures: m.status === Image.Ready ? given : null }\n'
+            'ShaderEffect { anchors.fill: parent; property var source: d.picture } }', "utf-8")
+        view.setSource(QUrl.fromLocalFile(str(Path(folder) / "develop.qml")))
+    assert not view.errors(), view.errors()
+    view.show()
+    clock = time.monotonic()
+    while not view.rootObject().property("there") and time.monotonic() < clock + 10:
+        QGuiApplication.processEvents()
+    for _ in range(3):
+        QGuiApplication.processEvents()
+    grab = view.grabWindow().convertToFormat(QImage.Format.Format_RGBA8888)
+    ours = np.frombuffer(grab.constBits(), np.uint8).reshape(h, grab.bytesPerLine())[:, :w * 4].reshape(h, w, 4)[..., :3]
+    with rawpy.imread(str(path)) as raw:
+        theirs, _ = decode.trimmed(decode.developed(raw, False), raw.sizes, False)
+    off = np.abs(ours.astype(int) - np.round(theirs / 257).astype(int))
+    # (Its fine stripes are AHD's hardest case: a third of the points differ from LibRaw's half
+    # size, against some 2 % on a photo. So the comparison is shown LibRaw's own picture, and
+    # that with no green.)
+    small = (theirs[::2, ::2] / np.float32(65535))[:len(theirs) // 2, :theirs.shape[1] // 2]
+    same, broken = small[:-1, :-1], small[:-1, :-1] * np.float32([1, 0, 1])
+    fine = app.unlike(same, small) == 0 and app.unlike(broken, small) > 0.5
+    print("ok" if off.max() <= 1 and fine else f"off by up to {off.max()} of 255 in "
+          f"{(off > 1).mean():.1%} of the photo" + ("" if fine else "; checkDeveloped is blind"))
 
 
 def _own(held, scene: np.ndarray, c: int) -> np.ndarray:
@@ -3322,6 +3395,7 @@ def main() -> None:
     check_denoise_kinds()
     check_denoise_phase()
     check_denoise_brightness()
+    check_develop_on_gpu()
     check_denoise_exact()
     check_workers()
     check_no_orphan()
@@ -3334,4 +3408,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--develop-on-gpu"]:
+        develop_on_gpu(Path(sys.argv[2]))
+    else:
+        main()

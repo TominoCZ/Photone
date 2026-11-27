@@ -29,24 +29,38 @@ Item {
     readonly property bool there: denoiser.state !== "" && denoiser.state !== "working" && denoiser.state !== "failed"
                                   && cleanPicture.status === Image.Ready && cleanPicture.sourceSize.width > 1 && stage.ready && stage.sharpThere
     readonly property bool busy: denoiser.state === "working" || denoiser.state === "saving" || (denoiser.state === "ready" && !there)
-    // Which net made the result (photone/denoise.py, `chosen`), a quiet line under the photo's
-    // name (the owner's pick of three rendered, 2026-11-21): the raw net's, and why the older
-    // one ran where the photo's sensor is the reason. While no raw net is installed, nothing.
-    readonly property string reason: ({ pattern: "this camera's sensor pattern isn't supported by the new one yet.",
-                                        layout: "this file's sensor layout isn't supported by the new one yet." })[denoiser.why] || ""
-    readonly property string which: denoiser.kind === "sensor" ? "Denoised from the sensor's data"
-                                    : denoiser.kind === "developed" && reason !== "" ? "Older denoiser: " + reason : ""
+    // The two models (photone/denoise.py: a raw net, from the sensor's own data, and the older
+    // one, from the developed picture), and the one asked for: the sensor's, unless the other
+    // was picked the last time. A photo the sensor's model can't take (`chosen` says why)
+    // goes through the other, with that entry dimmed and a quiet line saying why; what is
+    // asked for stays as it was, for the next photo.
+    readonly property var models: [{ kind: "sensor", label: "Sensor data" }, { kind: "developed", label: "Developed data" }]
+    property string model: session.remembered("denoise/model", "sensor") === "developed" ? "developed" : "sensor"
+    readonly property string reason: ({ pattern: "this camera's sensor pattern isn't supported yet.",
+                                        layout: "this file's sensor layout isn't supported yet.",
+                                        missing: "its file is missing." })[denoiser.why] || ""
+    readonly property bool sensorFits: reason === ""
+    readonly property string running: denoiser.kind !== "" ? denoiser.kind : model   // the one on show
+    function fits(kind) { return kind !== "sensor" || sensorFits }
+    function pick(kind) {
+        picker.shut()
+        if (kind === running || !fits(kind) || denoiser.state === "saving") return
+        model = kind
+        session.remember("denoise/model", kind)
+        denoiser.start(session.path, kind)
+    }
 
     function open() {
         // Where the photo was being looked at, at 100 %: noise is judged from close.
         view.center = stage.center; view.zoom = 1; view.fitted = false
         visible = true
         cancel.forceActiveFocus()
-        denoiser.start(session.path)
+        denoiser.start(session.path, model)
     }
     function close() {
         if (!visible) return
         visible = false
+        picker.shut()
         denoiser.close()
         closed()
     }
@@ -59,8 +73,14 @@ Item {
 
     // While it is up, the keys are its own: Escape is Cancel, Tab goes between its buttons.
     Keys.onPressed: (event) => {
-        if (event.key === Qt.Key_Escape && denoiser.state !== "saving") close()
-        else if ([Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Left, Qt.Key_Right].includes(event.key)) (confirm.activeFocus || !confirm.enabled ? cancel : confirm).forceActiveFocus()
+        if (event.key === Qt.Key_Escape && picker.visible) picker.shut()
+        else if (event.key === Qt.Key_Escape && denoiser.state !== "saving") close()
+        else if ([Qt.Key_Left, Qt.Key_Right].includes(event.key)) (confirm.activeFocus || !confirm.enabled ? cancel : confirm).forceActiveFocus()
+        else if ([Qt.Key_Tab, Qt.Key_Backtab].includes(event.key)) {   // Model, Cancel, Accept, and round
+            const stops = [chosen, cancel, confirm].filter(item => item.enabled)
+            const at = stops.findIndex(item => item.activeFocus)
+            stops[(Math.max(at, event.key === Qt.Key_Tab ? -1 : 0) + (event.key === Qt.Key_Tab ? 1 : stops.length - 1)) % stops.length].forceActiveFocus()
+        }
         event.accepted = true
     }
     Keys.onReleased: (event) => event.accepted = true
@@ -234,13 +254,49 @@ Item {
                 width: parent.width; spacing: 6
                 Label { text: "Neural Denoise"; color: Theme.text; font.pixelSize: 17; font.weight: Font.DemiBold }
                 Label { width: parent.width; elide: Text.ElideMiddle; text: session.name }
+                Item { width: 1; height: 4 }
+                // Which model: a setting's row, its value a button that opens the list (`picker`).
+                Item {
+                    width: parent.width; height: 34
+                    Label { anchors.verticalCenter: parent.verticalCenter; text: "Model" }
+                    Rectangle {
+                        id: chosen
+                        objectName: "denoise-model"
+                        anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                        width: 170; height: 30; radius: 6
+                        enabled: denoiser.state !== "saving"; opacity: enabled ? 1 : 0.4
+                        color: picker.visible || chosenArea.containsMouse ? Theme.selected : Theme.raised
+                        border { width: activeFocus ? 1 : 0; color: Theme.text }
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.ComboBox; Accessible.name: "Model"; Accessible.description: chosenText.text
+                        // Space or Enter opens the list; the arrows up and down pick without it.
+                        Keys.onPressed: (event) => {
+                            const at = window.models.findIndex(m => m.kind === window.running)
+                            if ([Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter].includes(event.key)) { if (!event.isAutoRepeat) picker.visible = !picker.visible }
+                            else if (event.key === Qt.Key_Up && at > 0) window.pick(window.models[at - 1].kind)
+                            else if (event.key === Qt.Key_Down && at < window.models.length - 1) window.pick(window.models[at + 1].kind)
+                            else if (event.key !== Qt.Key_Up && event.key !== Qt.Key_Down) return
+                            event.accepted = true
+                        }
+                        Label {
+                            id: chosenText
+                            x: 10; width: parent.width - 36; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; color: Theme.text
+                            text: (window.models.find(m => m.kind === window.running) || window.models[0]).label
+                        }
+                        Icon {
+                            anchors { right: parent.right; rightMargin: 8; verticalCenter: parent.verticalCenter }
+                            width: 14; height: 14; stroke: 2; rotation: 90; path: "M7.5 4.5 L13 10 L7.5 15.5"; color: Theme.dim   // (a card's chevron, open)
+                        }
+                        MouseArea { id: chosenArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { chosen.forceActiveFocus(); picker.visible = !picker.visible } }
+                    }
+                }
                 Label {
                     objectName: "denoise-which"
-                    visible: window.which !== ""
+                    visible: window.reason !== "" && denoiser.kind !== ""
                     width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 12; color: Theme.faint
-                    text: window.which
+                    text: "The sensor data model can't be used for this photo: " + window.reason
                 }
-                Item { width: 1; height: 10 }
+                Item { width: 1; height: 6 }
                 ParamSlider {
                     objectName: "denoise-grain"
                     width: parent.width; name: "Grain removal"; unit: "%"; from: 0; to: 100; neutral: 100; step: 1; digits: 0; signed: false
@@ -272,6 +328,43 @@ Item {
                         label: window.there ? "Accept" : "Denoise"; tint: Theme.green
                         enabled: window.there && denoiser.state === "ready"; opacity: enabled ? 1 : 0.4
                         onPressed: if (enabled) denoiser.save(window.colorShare / 100, window.grainShare / 100)
+                    }
+                }
+            }
+        }
+
+        // ---- the list of models, open: as a menu is (Main.qml), under its button ----------
+        Item {
+            id: picker
+            anchors.fill: parent
+            visible: false
+            function shut() { visible = false }
+            MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; onPressed: picker.shut(); onWheel: (wheel) => picker.shut() }
+            Rectangle {
+                objectName: "modal:denoise-models"
+                readonly property point under: (card.width, card.height, picker.visible, chosen.mapToItem(card, 0, chosen.height + 4))
+                x: under.x; y: under.y
+                width: chosen.width; height: kinds.height + 8; radius: 8
+                color: Theme.panel; border { width: 1; color: Theme.faint }
+                Accessible.role: Accessible.PopupMenu; Accessible.name: "Model"
+                MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }   // (a press on the list itself is not one beside it)
+                Column {
+                    id: kinds
+                    x: 4; y: 4; width: parent.width - 8
+                    Repeater {
+                        model: window.models
+                        Rectangle {
+                            required property var modelData
+                            readonly property bool usable: window.fits(modelData.kind)
+                            objectName: "denoise-model-" + modelData.kind
+                            width: kinds.width; height: 30; radius: 5
+                            // (What can't be used here stays in its place, dimmed.)
+                            enabled: usable; opacity: usable ? 1 : 0.35
+                            color: kindArea.containsMouse && usable ? Theme.selected : modelData.kind === window.running ? Theme.raised : "transparent"
+                            Accessible.role: Accessible.MenuItem; Accessible.name: modelData.label
+                            Label { x: 10; anchors.verticalCenter: parent.verticalCenter; text: parent.modelData.label; color: Theme.text }
+                            MouseArea { id: kindArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.pick(parent.modelData.kind) }
+                        }
                     }
                 }
             }

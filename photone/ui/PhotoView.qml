@@ -134,7 +134,7 @@ Item {
     // in it are already the new picture's. It is another only when a LUT is added or taken
     // away, not when their order, strength or eye changes.)
     Image { id: lutPixels; source: session.lutSource; asynchronous: true; cache: false; visible: false }
-    readonly property var sharpest: sharpReady ? sharpPixels : pixels   // every pixel of the photo, once it is there (the grain's loupe)
+    readonly property var sharpest: sharpReady ? (developed.on ? developed.picture : sharpPixels) : pixels   // every pixel of the photo, once it is there (the grain's loupe)
     readonly property bool sharpThere: sharpReady
     // The first pictures of the open photo and of the photos either side of it (`session.held`),
     // each kept by one of these three while it is wanted: a step to a photo beside the open one
@@ -169,6 +169,16 @@ Item {
         // (Its decoding runs regardless.)
         source: view.sharpFor === session.source ? session.fullSource : ""
         asynchronous: true; cache: false; visible: false
+        smooth: !developed.on   // (a mosaic is read value by value)
+    }
+    // A raw file's full size comes as its mosaic, and is developed here (decode.figures).
+    Develop {
+        id: developed
+        mosaic: sharpPixels
+        figures: sharpPixels.status === Image.Ready ? session.mosaicOf(String(sharpPixels.source)) : null
+        // (Its first pixels read back and compared to LibRaw's: where they differ, the file is
+        // developed by LibRaw instead.)
+        onOnChanged: if (on) session.checkDeveloped(picture, String(sharpPixels.source))
     }
     property string sharpFor: ""   // the photo (its first picture) whose sharp one is asked for
     FrameAnimation { running: view.have && view.sharpFor !== session.source; onTriggered: view.sharpFor = session.source }
